@@ -1,0 +1,214 @@
+From 9a3c5e17b2d4f68c0e1a3b5d7f9012345678abcd Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Wed, 4 Nov 2026 22:40:00 -0500
+Subject: [PATCH] glm-cuda: TF_GLM_MM_CUBLAS, a prompt's dense linears through
+ cuBLASLt
+
+A prompt's dense projections run glm_mm's own prompt kernel, warp-level mma.sync. On a Jetson AGX Thor (sm_110) the SM
+is the datacenter Blackwell design and keeps tcgen05/TMEM, the 5th-gen tensor core; cuBLAS dispatches it, the engine's
+kernels cannot. Measured on this pair over glm-mm-bench's eight GLM shapes: 1.16 ms against the kernel's 6.41 at 512
+rows (5.5x), 0.81 against 1.80 at 128 (2.2x).
+
+TF_GLM_MM_CUBLAS=1 keeps every dense linear's rows as a row-major bf16 [n][k] matrix beside its tiles (one arena, the
+bf16 size of the dense weights) and sends a prompt's matmuls (128 rows and up, one K slice) to cuBLASLt through the
+binding the vision tower already uses. Off (the default) nothing is copied and the kernels run as they were. Decode
+rows stay on the kernels: a cuBLASLt call a linear a token is host overhead the kernels do not pay, and at 8 rows the
+1.6x it shows in isolation was 17.8 -> 9.6 tok/s in practice.
+
+cuBLAS accumulates in fp32 in its own order, so the sums are not bit-identical to glm_mm's: the replies differ in the
+last bits, which is the trade the switch makes.
+
+---
+ zig/src/families/glm/cuda_mm.zig   | 78 +++++++++++++++++++++++++++++++++++++++++
+ zig/src/families/glm/cuda_tile.zig | 32 ++++++++++++++++++++---
+ 2 files changed, 106 insertions(+), 4 deletions(-)
+
+--- a/zig/src/families/glm/cuda_mm.zig	2026-11-05 09:19:28.061128042 -0500
++++ b/zig/src/families/glm/cuda_mm.zig	2026-11-05 10:53:31.764182478 -0500
+@@ -3,7 +3,8 @@
+ const cuda = @import("cuda");
+ 
+ /// A linear's tiles: bf16 pairs (glm_mm_tile16), or `bits`-bit codes (glm_mm_tile4/6/8) with fp16 scales at `s`.
+-pub const Tiled = struct { w: u64, n: usize, k: usize, s: u64 = 0, bits: u8 = 16 };
++/// `plain` is the same weights as a row-major bf16 [n][k] matrix (TF_GLM_MM_CUBLAS's copy; 0 without it).
++pub const Tiled = struct { w: u64, n: usize, k: usize, s: u64 = 0, bits: u8 = 16, plain: u64 = 0 };
+ 
+ /// The widths glm_mm packs to, by kernel set: bf16 first.
+ const widths = [_]u8{ 16, 4, 6, 8 };
+@@ -21,6 +22,7 @@
+ pub const Packed = struct {
+     ptrs: []const u64 = &.{},
+     bits: []const u8 = &.{},
++    plain: []const u64 = &.{}, // each linear's row-major bf16 copy, in ptrs' order (TF_GLM_MM_CUBLAS; empty without it)
+ 
+     /// The tiled weight `w` [n][k] as the matmul reads it: packed codes with their scales after them, or bf16.
+     pub fn tiled(p: *const Packed, w: u64, n: usize, k: usize) Tiled {
+@@ -32,7 +34,8 @@
+         }
+         if (lo == p.ptrs.len or p.ptrs[lo] != w) return .{ .w = w, .n = n, .k = k };
+         const b = p.bits[lo];
+-        return .{ .w = w, .n = n, .k = k, .s = w + packedBytes(n, k, b)[0], .bits = b };
++        const plain: u64 = if (lo < p.plain.len) p.plain[lo] else 0;
++        return .{ .w = w, .n = n, .k = k, .s = w + packedBytes(n, k, b)[0], .bits = b, .plain = plain };
+     }
+ };
+ 
+@@ -271,6 +274,63 @@
+     try std.testing.expectEqual(default_stage_index, stageIndex("4"));
+ }
+ 
++/// TF_GLM_MM_CUBLAS=1: a prompt's dense linears go to cuBLASLt instead of glm_mm's prompt kernel. On a Jetson AGX
++/// Thor that is the 5th-gen tensor core (tcgen05/TMEM), which cuBLAS dispatches and the engine's mma.sync kernels do
++/// not: 5.5x the kernel's time at 512 rows, 2.2x at 128. Off (the default) is the kernels as they were. cuBLAS
++/// accumulates in fp32 in its own order, so the sums are not bit-identical to glm_mm's; the replies differ in the last
++/// bits, which is the trade this switch makes. Decode rows (< 128) stay on the kernels: 1.6x there is not worth a
++/// launch.
++pub fn cublasEnabled() bool {
++    const v = std.c.getenv("TF_GLM_MM_CUBLAS") orelse return false;
++    const t = std.mem.span(v);
++    return !(t.len == 0 or std.mem.eql(u8, t, "0"));
++}
++
++/// One plan a (m, n, k, out type): cuBLASLt's algorithm choice for the shape, kept for the next call.
++const Plan = struct { m: u64, n: u64, k: u64, out_f32: bool, lin: cuda.cublaslt.Linear };
++const max_plans = 512; // a prompt's row counts vary (chunk, tail, batched rows): one plan a shape
++
++/// The cuBLASLt handle, its workspace and the plans, opened on the first prompt matmul (TF_GLM_MM_CUBLAS).
++const Blas = struct {
++    lt: cuda.cublaslt.Library,
++    ws: cuda.DeviceBuffer,
++    ws_len: usize,
++    plans: [max_plans]Plan = undefined,
++    n_plans: usize = 0,
++};
++var blas_state: ?Blas = null;
++
++fn blasFor(d: *const cuda.Driver) !*Blas {
++    if (blas_state == null) {
++        const ws_len: usize = 32 << 20;
++        const b: Blas = .{ .lt = try cuda.cublaslt.Library.open(), .ws = try cuda.DeviceBuffer.alloc(d, ws_len), .ws_len = ws_len };
++        std.log.info("glm_mm prompt linears: cuBLASLt (TF_GLM_MM_CUBLAS), {d} MiB workspace", .{ws_len >> 20});
++        blas_state = b;
++    }
++    return &blas_state.?;
++}
++
++/// D[rows][n] = X[rows][k] . W[n][k]^T in bf16 with fp32 accumulate, out fp32 (`out_f32`) or bf16.
++fn cublasMm(s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, kk: usize, out_f32: bool) !void {
++    const b = try blasFor(s.d);
++    const out_ty: cuda.cublaslt.DataType = if (out_f32) .f32 else .bf16;
++    var plan: ?*Plan = null;
++    for (b.plans[0..b.n_plans]) |*p| {
++        if (p.m == rows and p.n == n and p.k == kk and p.out_f32 == out_f32) {
++            plan = p;
++            break;
++        }
++    }
++    if (plan == null) {
++        if (b.n_plans == max_plans) return error.TooManyPlans;
++        const p = &b.plans[b.n_plans];
++        p.* = .{ .m = rows, .n = n, .k = kk, .out_f32 = out_f32, .lin = try cuda.cublaslt.Linear.init(&b.lt, rows, n, kk, out_ty, b.ws_len) };
++        b.n_plans += 1;
++        plan = p;
++    }
++    try plan.?.lin.run(x, w, out, b.ws.ptr, b.ws_len, s.handle);
++}
++
+ /// K slices fixed by the shape: column tiles times slices reach the target, each slice at least 4 groups of 64.
+ pub fn splitK(n: usize, k: usize) usize {
+     const tiles = (n + 63) / 64;
+@@ -317,6 +377,15 @@
+         a.add(@as(c_int, @intCast(sk)));
+         const cols: u32 = @intCast((w.n + 63) / 64);
+         const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
++        // A prompt's dense linear through cuBLASLt (TF_GLM_MM_CUBLAS): the 5th-gen tensor core where the GPU has one.
++        if (big and w.plain != 0 and sk == 1 and rows >= 128 and cublasEnabled()) {
++            if (cublasMm(s, x + done * ldx * 2, w.plain, out + done * w.n * @as(usize, if (wide) 4 else 2), rows, w.n, w.k, wide)) {
++                done += rows;
++                continue;
++            } else |e| { // never fatal: the kernel below produces the same matrix
++                std.log.err("glm_mm cuBLASLt {d}x{d}x{d}: {}; the kernel takes it", .{ rows, w.n, w.k, e });
++            }
++        }
+         if (big and wi == 0) {
+             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
+         } else if (big) { // packed prompts: the 128-row blocks in two stages, two an SM (the 3-stage kernel's sums)
+--- a/zig/src/families/glm/cuda_tile.zig	2026-11-05 09:19:26.757124011 -0500
++++ b/zig/src/families/glm/cuda_tile.zig	2026-11-05 10:20:05.297546240 -0500
+@@ -98,7 +98,17 @@
+     defer list.deinit(w.gpa);
+     try linears(w, &list);
+     var most: usize = 0;
+-    for (list.items) |e| most = @max(most, e.n * e.k * 2);
++    var plain_bytes: usize = 0; // TF_GLM_MM_CUBLAS: every linear's row-major bf16 copy, one arena
++    for (list.items) |e| {
++        most = @max(most, e.n * e.k * 2);
++        plain_bytes += e.n * e.k * 2;
++    }
++    const cublas = mm_mod.cublasEnabled();
++    var plain: ?cuda.DeviceBuffer = if (cublas and plain_bytes > 0) try cuda.DeviceBuffer.alloc(d, plain_bytes) else null;
++    errdefer if (plain) |*b| b.free();
++    var plain_at: usize = 0;
++    var plain_ptrs: std.ArrayList(u64) = .empty;
++    errdefer plain_ptrs.deinit(gpa);
+     var tmp = try cuda.DeviceBuffer.alloc(d, most);
+     defer tmp.free();
+     errdefer @import("cuda_load_owner.zig").drain(s, d);
+@@ -119,6 +129,11 @@
+         const ptr = e.field.*;
+         const bits = if (i + 1 == list.items.len and w.head == .bf16) head_bits else dense_bits; // an MXFP8 head stays
+         if (bits == 16) {
++            if (plain) |pl| { // its rows, as cuBLASLt reads them, before the tiling overwrites them
++                try d.check(d.api.cuMemcpyDtoDAsync_v2(pl.ptr + plain_at, ptr, n * k * 2, s.handle), "cuMemcpyDtoDAsync");
++                try plain_ptrs.append(gpa, pl.ptr + plain_at);
++                plain_at += n * k * 2;
++            }
+             try mm_mod.tile(mk, s, ptr, tmp.ptr, n, k);
+             try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, n * k * 2, s.handle), "cuMemcpyDtoDAsync");
+             continue;
+@@ -126,6 +141,11 @@
+         try host.resize(gpa, n * k);
+         try s.synchronize();
+         try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.items.ptr), ptr, n * k * 2), "cuMemcpyDtoH");
++        if (plain) |pl| { // the same rows into the arena, as a row-major bf16 [n][k] matrix
++            try d.check(d.api.cuMemcpyHtoDAsync_v2(pl.ptr + plain_at, @ptrCast(host.items.ptr), n * k * 2, s.handle), "cuMemcpyHtoDAsync");
++            try plain_ptrs.append(gpa, pl.ptr + plain_at);
++            plain_at += n * k * 2;
++        }
+         try words.resize(gpa, n * k * bits / 32);
+         try scales.resize(gpa, n * (k / 64));
+         qpack.quantize(bits, host.items, n, k, words.items, scales.items);
+@@ -141,22 +161,28 @@
+     try s.synchronize();
+     if (packed_ptrs.items.len > 0) std.log.info("glm: {d} linears packed ({d}/{d} bits), {d:.2} GiB freed", .{ packed_ptrs.items.len, dense_bits, head_bits, @as(f64, @floatFromInt(freed)) / (1 << 30) });
+     // sorted by pointer, the bits beside them (Packed.tiled searches)
++    if (plain) |pl| try w.buffers.append(gpa, pl); // owned with the weights; freed by the model's teardown
++    plain = null; // the weights own it now
+     const ptrs = try packed_ptrs.toOwnedSlice(gpa);
+     errdefer gpa.free(ptrs);
+     const bits_out = try packed_bits.toOwnedSlice(gpa);
++    const plains = try plain_ptrs.toOwnedSlice(gpa);
++    errdefer gpa.free(plains);
+     const Ctx = struct {
+         p: []u64,
+         b: []u8,
++        pl: []u64,
+         pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+             return c.p[a] < c.p[b];
+         }
+         pub fn swap(c: @This(), a: usize, b: usize) void {
+             std.mem.swap(u64, &c.p[a], &c.p[b]);
+             std.mem.swap(u8, &c.b[a], &c.b[b]);
++            if (a < c.pl.len and b < c.pl.len) std.mem.swap(u64, &c.pl[a], &c.pl[b]);
+         }
+     };
+-    std.sort.pdqContext(0, ptrs.len, Ctx{ .p = ptrs, .b = bits_out });
+-    return .{ .ptrs = ptrs, .bits = bits_out };
++    std.sort.pdqContext(0, ptrs.len, Ctx{ .p = ptrs, .b = bits_out, .pl = plains });
++    return .{ .ptrs = ptrs, .bits = bits_out, .plain = plains };
+ }
+ 
+ test "GLM TP3: the tiler keeps unsupported KDA input and view weights in row-major order" {
+-- 
+2.53.0
+
