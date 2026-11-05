@@ -181,25 +181,35 @@ write_worker_env() {
     || fail E_START "Could not place the environment file on $(worker_host)."
 }
 
-# Rank r's own placement and link settings.
+# Rank r's own placement and link settings. An RDMA fabric (LINK_KIND=ib) is given NCCL's IB transport and, when
+# ROCE=on, the engine's RoCE all-gathers; a TCP fabric (LINK_KIND=tcp) is given NCCL's socket transport over every rail
+# and no verbs at all.
 rank_env_args() {
-  local r=$1
+  local r=$1 dev hca gid
+  if (( r == 0 )); then dev=$LINK_DEV; hca=$LINK_HCA; gid=$LINK_GID
+  else dev=$WORKER_DEV; hca=$WORKER_HCA; gid=$WORKER_GID; fi
   RANK_ENV=(-e "TF_GLM_RANK=$r")
-  if (( r == 0 )); then
-    RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=$LINK_DEV" -e "NCCL_IB_HCA=$LINK_HCA" -e "NCCL_IB_GID_INDEX=$LINK_GID")
-    [[ "$ROCE" != on ]] || RANK_ENV+=(-e "TF_ROCE_HCA=$LINK_HCA")
+  if [[ "${LINK_KIND:-ib}" == ib ]]; then
+    RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=$dev" -e "NCCL_IB_HCA=$hca" -e "NCCL_IB_GID_INDEX=$gid")
+    [[ "$ROCE" != on ]] || RANK_ENV+=(-e "TF_ROCE_HCA=$hca")
   else
-    RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=$WORKER_DEV" -e "NCCL_IB_HCA=$WORKER_HCA" -e "NCCL_IB_GID_INDEX=$WORKER_GID")
-    [[ "$ROCE" != on ]] || RANK_ENV+=(-e "TF_ROCE_HCA=$WORKER_HCA")
+    RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=$dev" -e "NCCL_IB_DISABLE=1")
   fi
   RANK_ENV+=(-e "NCCL_MIN_NCHANNELS=$NCCL_CHANNELS" -e "NCCL_MAX_NCHANNELS=$NCCL_CHANNELS")
 }
 
-# Every container gets the GPU, the host network (NCCL_COMM_ID is a host address), the RDMA devices and the locked
-# memory the RoCE region and NCCL's IB transport need.
-RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --cap-add IPC_LOCK
-          --ulimit memlock=-1 --ulimit stack=67108864)
-[[ ! -e /dev/infiniband ]] || RUN_ARGS+=(--device /dev/infiniband)
+# Everything a rank's container needs besides its mounts and settings. The GPU flags differ per node (see gpu_args),
+# so they are resolved per node when a start is planned: the worker's image and driver are asked over ssh.
+build_run_args() {
+  RUN_ARGS=(--ipc=host --network host --shm-size 16g --cap-add IPC_LOCK
+            --ulimit memlock=-1 --ulimit stack=67108864)
+  [[ ! -e /dev/infiniband ]] || RUN_ARGS+=(--device /dev/infiniband)
+  local -a gpu_local=() gpu_worker=()
+  mapfile -t gpu_local < <(gpu_args '')
+  mapfile -t gpu_worker < <(gpu_args worker)
+  RUN_ARGS_LOCAL=("${gpu_local[@]}" "${RUN_ARGS[@]}")
+  RUN_ARGS_WORKER=("${gpu_worker[@]}" "${RUN_ARGS[@]}")
+}
 
 # The ranks' command lines, as each Spark starts them.
 show_ranks() {
@@ -284,6 +294,7 @@ launch() {
   local worker_ug='' unwritable
   build_serve_args "$ctx"
   build_env_args
+  build_run_args
   [[ -z "$CONTAINER_USER" ]] || user_args=(--user "$CONTAINER_USER")
   worker_user_args=("${user_args[@]}")
   # The worker's own login when CONTAINER_USER is this Spark's (the default, or set to the same value), as scripts/tp4.sh
@@ -323,7 +334,7 @@ launch() {
   done
   [[ -z "$WORKER_ENV_FILE" ]] || worker_env+=(--env-file "$WORKER_ENV_FILE")
   wcmd=(docker run -d --name "$CONTAINER_NAME" --label tf.recipe=glm53-spark --label "tf.patches=$PATCHES_HASH"
-    --init --restart=no "${RUN_ARGS[@]}" "${worker_user_args[@]}" "${worker_env[@]}" "${RANK_ENV[@]}"
+    --init --restart=no "${RUN_ARGS_WORKER[@]}" "${worker_user_args[@]}" "${worker_env[@]}" "${RANK_ENV[@]}"
     "${WORKER_MOUNTS[@]}" -v "$WORKER_CACHE_DIR:/state")
   [[ -z "$TEMPLATE_FILE" ]] || wcmd+=(-v "$WORKER_TEMPLATE:/templates/chat_template.jinja:ro")
   wcmd+=(--entrypoint "$TF_BIN" "$IMAGE" serve /model "${SERVE_ARGS[@]}")
@@ -342,7 +353,7 @@ launch() {
   [[ -z "$TEMPLATE_FILE" ]] || mounts+=(-v "$TEMPLATE_FILE:/templates/chat_template.jinja:ro")
   mounts+=(-v "$CACHE_DIR:/state")
   cmd=(docker run -d --name "$CONTAINER_NAME" --label tf.recipe=glm53-spark --label "tf.patches=$PATCHES_HASH"
-    --init --restart=no "${RUN_ARGS[@]}" "${user_args[@]}" "${ENV_ARGS[@]}" "${RANK_ENV[@]}" "${mounts[@]}"
+    --init --restart=no "${RUN_ARGS_LOCAL[@]}" "${user_args[@]}" "${ENV_ARGS[@]}" "${RANK_ENV[@]}" "${mounts[@]}"
     --entrypoint "$TF_BIN" "$IMAGE" serve /model "${SERVE_ARGS[@]}")
   if [[ "$DRY_RUN" == 1 ]]; then log 'Here:'; plan "${cmd[@]}"; return 0; fi
   "${cmd[@]}" >/dev/null || { stop_both; fail E_START 'Docker could not launch rank 0. Check its error and rerun.'; }
@@ -456,14 +467,14 @@ PY
 }
 
 banner
-printf '\n%s\n%s at once | context %s (%s)\n%s dense, %s head, %s KV | %s drafts | vision %s | reserve %s GiB | port %s\nrank 0 here, rank 1 on %s | RoCE %s\n' \
+printf '\n%s\n%s at once | context %s (%s)\n%s dense, %s head, %s KV | %s drafts | vision %s | reserve %s GiB | port %s\nrank 0 here, rank 1 on %s | sm_%s\n' \
   "$MODEL_DESC" "$PARALLEL" "$CTX" "$CTX_NOTE" "$DENSE" "$HEAD" "$KV$([[ "$KV_PAGES" != on ]] || echo ' (one shared page pool; context = one request'"'"'s cap)')" \
-  "$DRAFTER" "$VISION" "$MEMORY_RESERVE_GIB" "$PORT" "$(worker_host)" "$ROCE"
+  "$DRAFTER" "$VISION" "$MEMORY_RESERVE_GIB" "$PORT" "$(worker_host)" "$SM"
 
 step 1 'Check both Sparks: Linux aarch64, Docker, the NVIDIA runtime, memory, disk and ports'
 if [[ "$DRY_RUN" == 1 ]]; then
   log '[I_DRY_RUN] Plan only: nothing is built, started, downloaded, sent or changed. The link below is probed read-only.'
-  log "Check Linux aarch64, docker group access and the NVIDIA runtime here and on $(worker_host) over ssh; a GB10 on each;"
+  log "Check Linux aarch64, docker group access and the GPU passthrough here and on $(worker_host) over ssh; a GB10 or a Thor on each;"
   log "$MIN_AVAIL_GIB GiB available on each (MemAvailable plus parked pages, as the engine counts it); disk for what is missing;"
   log "port $PORT on $HOST and $NCCL_PORT-$((NCCL_PORT + 1)) on this Spark's link address. Refuse if another start or stop holds $STATE_DIR/start.lock."
   if [[ "$MODE" == restart ]]; then DRY_RUN=1 "$REPO_ROOT/stop.sh"; fi
@@ -513,7 +524,7 @@ step 3 'Download or check the checkpoint and the drafter weights on both Sparks'
 prepare_weights
 model_overlay
 
-step 4 "Find the link between the Sparks and the RDMA devices it runs on"
+step 4 "Find the link between the nodes: its rails, and its RDMA devices when both expose one"
 check_link
 prepare_worker_weights
 

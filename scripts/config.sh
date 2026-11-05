@@ -33,11 +33,16 @@ TF_REF="${TF_REF:-f350cd3ea253a042e205746928271f9d8f71a82d}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 # sha256 of zig-aarch64-linux-0.17.0.tar.xz (ziglang.org/download/index.json).
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
-SM="${SM:-121}"                                  # DGX Spark GB10: sm_121 (the engine's own default -Dsm target)
-ZIG_CPU="${ZIG_CPU:-native}"                     # the image is built on a Spark and runs on Sparks; baseline to move it
+SM="${SM:-}"                                      # empty/auto: the GPU's own compute capability (GB10 sm_121, Jetson AGX Thor sm_110)
+ZIG_CPU="${ZIG_CPU:-native}"                     # the image is built on a node and runs on it; baseline to move it
 NCCL_WHEEL="${NCCL_WHEEL:-}"                     # non-empty: install this nvidia-nccl-cu13 version over the base image's
 IMAGE="${IMAGE:-}"                               # empty: tensorfold-glm53-spark:<PATCHES_HASH>
 IMAGE_REPO="${IMAGE_REPO:-tensorfold-glm53-spark}"
+# How Docker hands a container the GPU. gpus: `--gpus all` (the NVIDIA Container Toolkit's prestart hook, what DGX OS
+# ships on a Spark). runtime: `--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all` (JetPack on a Jetson AGX Thor, where
+# `--gpus` refuses: "invoking the NVIDIA Container Runtime Hook directly ... is not supported"). auto: runtime when the
+# daemon lists an `nvidia` runtime, else gpus. Probed per node: a mixed pair takes each node's own answer.
+GPU_RUNTIME="${GPU_RUNTIME:-auto}"
 DOCKER_BUILD_FLAGS="${DOCKER_BUILD_FLAGS:-}"     # extra docker build flags, word-split (e.g. --progress=plain)
 TF_BIN="${TF_BIN:-/usr/local/bin/tensorfold-native}"
 CONTAINER_NAME="${CONTAINER_NAME:-glm53-spark}"  # never a DeepSeek recipe's container on these Sparks
@@ -57,9 +62,14 @@ SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=aut
 # two netdevs and two RDMA devices; both are used) and the RoCE v2 GID index that holds each side's IPv4 address.
 FABRIC_PEER="${FABRIC_PEER:-}"                   # the worker's address on the link (auto)
 FABRIC_SELF="${FABRIC_SELF:-}"                   # this Spark's address on the link (auto); rank 0's NCCL_COMM_ID address
-NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"     # this Spark's link netdev (auto); the worker's is found on the worker
+NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"     # this node's link netdev(s), comma separated (auto); the worker's is found on the worker
 TF_ROCE_HCA="${TF_ROCE_HCA:-}"                   # RDMA devices for the link, comma separated, at most two (auto)
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-}"       # the RoCE v2 IPv4 GID index (auto; it differs between hosts' tables)
+# Without an RDMA device on both nodes (a Jetson AGX Thor pair: its 100G QSFP cage is plain Ethernet over MGBE, no
+# RoCE) the link is TCP only: NCCL's socket transport over every rail, which start.sh finds as the directly reached
+# ports above FABRIC_MIN_SPEED_MBPS. NCCL pairs a rank's interface with the peer's on the same subnet, so each rail
+# carries its own channels.
+FABRIC_MIN_SPEED_MBPS="${FABRIC_MIN_SPEED_MBPS:-10000}"   # a link rail's speed floor; keeps a 1G/5G LAN out of the fabric
 NCCL_CHANNELS="${NCCL_CHANNELS:-4}"              # NCCL_MIN_NCHANNELS and NCCL_MAX_NCHANNELS
 PORT="${PORT:-8020}"
 HOST="${HOST:-0.0.0.0}"
@@ -70,7 +80,9 @@ SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash}"
 # measured upstream on two GB10s over one ConnectX-7 cable). Larger collectives stay on NCCL, and the size alone
 # decides, so both ranks always take the same path. Same bytes in the same places as NCCL: the same bits.
 # off (TF_ROCE=0 on either rank): NCCL carries everything.
-ROCE="${ROCE:-on}"
+# auto: on when both nodes expose an RDMA device (/dev/infiniband, /sys/class/infiniband), else off -- a Thor pair has
+# no verbs device at all, so the whole fabric is NCCL over TCP.
+ROCE="${ROCE:-auto}"                            # auto: on when both nodes expose an RDMA device, else off
 ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest shard the RDMA region holds
 
 # --- four Sparks (./start-tp4.sh, ./stop-tp4.sh; README "4 Sparks") -----------------------------------------------------

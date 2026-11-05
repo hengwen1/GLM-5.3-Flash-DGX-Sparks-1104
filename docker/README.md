@@ -1,7 +1,8 @@
 # docker/
 
 `docker/Dockerfile` builds TensorFold's native (Zig) CUDA server from source: upstream at a pinned commit, plus
-`patches/engine/*.patch`, with kernels for one GPU architecture (SM=121, a DGX Spark's GB10, by default). The build context is the repository root. The root
+`patches/engine/*.patch`, with kernels for one GPU architecture (`SM`, empty by default in the launcher, which reads
+the GPU: 121 for a DGX Spark's GB10, 110 for a Jetson AGX Thor). The build context is the repository root. The root
 `.dockerignore` sends only `patches/engine/` (a few bytes), so `logs/`, `.state/`, `.git` and models stay out.
 
 ```sh
@@ -13,6 +14,10 @@ docker build -f docker/Dockerfile \
   --build-arg SM=121 --build-arg PATCHES_HASH=dev \
   -t tensorfold-glm53-zig:dev .
 docker run --rm --gpus device=1 tensorfold-glm53-zig:dev tensorfold-native --version
+# On JetPack (Jetson AGX Thor) `--gpus` is refused; use the registered runtime and, when the driver's CUDA is older
+# than the image's floor, relax that floor to the driver's version:
+docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all -e 'NVIDIA_REQUIRE_CUDA=cuda>=13.2' \
+  tensorfold-glm53-zig:dev tensorfold-native --version
 ```
 
 ## Build args
@@ -23,7 +28,7 @@ docker run --rm --gpus device=1 tensorfold-glm53-zig:dev tensorfold-native --ver
 | `TF_REF` | required | Commit fetched at depth 1. A 40-hex ref must equal the fetched `HEAD`, or the build fails. |
 | `ZIG_VERSION` | `0.17.0` | Must equal the checkout's `.zig-version`. `build.zig` refuses any other Zig. |
 | `ZIG_SHA256` | required | sha256 of `zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz` (`ZIG_ARCH` is `aarch64` here), checked before unpacking. `ZIG_URL` overrides the download URL. |
-| `SM` | `120` | SASS targets for nvcc (`-Dsm`), comma separated, for example `120,121`. RTX PRO 6000 Blackwell is 120. |
+| `SM` | `121` | SASS targets for nvcc (`-Dsm`), comma separated, for example `120,121`. RTX PRO 6000 Blackwell is 120, a DGX Spark's GB10 is 121, a Jetson AGX Thor is 110. The launcher passes the GPU's own value. |
 | `PATCHES_HASH` | `dev` | Goes into the `tf.patches` label. The scripts compare it to decide whether to rebuild. |
 | `TOOLS` | `1` | `1` also runs `zig build install`: `tf-cuda-test`, `tf-tp-test`, `tf-tp-watch-check` and the CUDA dev CLI. `0` builds only the server and grammar library, about 4 minutes faster. |
 | `ZIG_CPU` | `native` | `-Dcpu` for host code. `native` targets the build machine's CPU, so build the image on a DGX Spark. Set `baseline` if the image will run on another aarch64 machine. |

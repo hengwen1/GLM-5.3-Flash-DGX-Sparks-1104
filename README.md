@@ -98,8 +98,12 @@ time. At equal dense width the engine is at parity with the v1.0.7 build's prefi
 
 - **Two DGX Sparks** (GB10, 128 GB, CUDA 13 driver) cabled to each other on their ConnectX-7 ports, with IPv4
   addresses on one subnet. One cable is two netdevs and two RDMA devices (the port's two PCIe links); both are used.
-- Key-based ssh from this Spark to the worker; your login in `docker` on both; Docker with the NVIDIA Container
-  Toolkit and BuildKit; `rdma-core` (without it every exchange stays on NCCL, more slowly).
+- **Or two Jetson AGX Thor** (sm_110, 122 GiB usable, JetPack 7) cabled on their 100G QSFP cage, with IPv4 addresses on
+  one subnet per rail. Thor exposes no RDMA device: NCCL's socket transport carries every exchange over the rails and
+  the engine's RoCE all-gathers are off. The launcher reads the GPU, the driver and the link, so nothing has to be set
+  by hand; [docs/thor.md](docs/thor.md) is the port's page.
+- Key-based ssh from this node to the worker; your login in `docker` on both; Docker with the NVIDIA Container
+  Toolkit and BuildKit; `rdma-core` on an RDMA fabric (without it every exchange stays on NCCL, more slowly).
 - `curl`, `python3`, `flock`, `tar`, `gzip`, `sha256sum`, `nvidia-smi`, `ssh`, `rsync`, `ip`, `awk`; `hf` for downloads.
 - The checkpoint `Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold@76c0b517` (about 164 GiB, downloaded when missing);
   both Sparks read every shard, so the worker gets it over the link (`WORKER_WEIGHTS=rsync`) or by NFS. The default
@@ -162,9 +166,9 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 | --- | --- | --- |
 | `WORKER` | **required** | The second Spark's ssh target on the direct link, e.g. `zurih@10.0.34.4` |
 | `TP` | `2` | Two Sparks with `./start.sh`; four cabled as a ring with `./start-tp4.sh` (below) |
-| `FABRIC_PEER`, `FABRIC_SELF`, `NCCL_SOCKET_IFNAME`, `TF_ROCE_HCA`, `NCCL_IB_GID_INDEX` | auto | Found from the route to `WORKER`, the port's RDMA devices and its RoCE v2 GID table |
+| `FABRIC_PEER`, `FABRIC_SELF`, `NCCL_SOCKET_IFNAME`, `TF_ROCE_HCA`, `NCCL_IB_GID_INDEX` | auto | Found from the route to `WORKER`, the port's RDMA devices and its RoCE v2 GID table; on a fabric without RDMA, from the rails' subnets and a full-size ping |
 | `NCCL_CHANNELS` | `4` | `NCCL_MIN_NCHANNELS` and `NCCL_MAX_NCHANNELS` |
-| `ROCE`, `ROCE_MAX_KB` | `on`, `4096` | The engine's one-shot RDMA all-gathers, and the largest shard they carry; `off` puts everything on NCCL |
+| `ROCE`, `ROCE_MAX_KB` | `auto`, `4096` | The engine's one-shot RDMA all-gathers, and the largest shard they carry; `off` puts everything on NCCL. Auto: on when both nodes expose an RDMA device |
 | `PORT`, `HOST`, `NCCL_PORT` | `8020`, `0.0.0.0`, `29583` | The API address; rank 0's bootstrap port on the link (the watch line uses the next one) |
 | `WORKER_WEIGHTS` | `rsync` | `rsync` the checkpoint over the link, `nfs` (the worker mounts it; `NFS_*` settings), or `check` (refuse unless present) |
 | `WORKER_MODEL_DIR`, `WORKER_DFLASH2_DIR`, `WORKER_CACHE_DIR` | the same paths | Where the worker keeps them; the home-based defaults re-root on the worker's own home when the two logins differ |
@@ -193,7 +197,9 @@ variables. **The served pair's `local.sh`** sets `PORT=8888`, `PARALLEL=8`, `CON
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `SM`, `ZIG_CPU` | `121`, `native` | GB10's target; `baseline` builds an image that runs elsewhere |
+| `SM`, `ZIG_CPU` | auto, `native` | The GPU's compute capability: `121` on a GB10, `110` on a Thor (read from the driver; set it to build elsewhere). `baseline` builds an image that runs anywhere |
+| `GPU_RUNTIME` | `auto` | `runtime` (`--runtime=nvidia`, JetPack on Thor) or `gpus` (`--gpus all`, DGX OS on a Spark); auto picks per node |
+| `FABRIC_MIN_SPEED_MBPS` | `10000` | On a TCP fabric (no RDMA device), the speed floor a rail must reach; keeps a 1G/5G LAN out |
 | `TF_REPO`, `TF_REF`, `ZIG_VERSION`, `ZIG_SHA256`, `NCCL_WHEEL` | pinned | All hashed into the image tag |
 | `IMAGE`, `IMAGE_REPO`, `DOCKER_BUILD_FLAGS`, `CONTAINER_NAME` | `tensorfold-glm53-spark:<hash>`, `glm53-spark` | |
 | `MEMGUARD`, `MEMGUARD_FLOOR_GIB`, `MEMGUARD_HOLD_S`, `MEMGUARD_INTERVAL_S`, `MIN_AVAIL_GIB` | `1`, `2.5`, `4`, `2`, `100` | See [Memory](#memory-on-a-128-gb-unified-spark) |

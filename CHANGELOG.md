@@ -1,5 +1,24 @@
 # Changelog
 
+- **2026-11-05** -- **`TF_GLM_MM_CUBLAS`** (patch 0107, opt-in, **off**): a prompt's dense linears through cuBLASLt,
+  which dispatches the 5th-gen tensor core (tcgen05/TMEM) a Jetson AGX Thor's SM has and the engine's `mma.sync` kernels
+  cannot reach. It works, and it is not worth its memory here: five fresh 2,547-token prompts read 651 tok/s against the
+  baseline's 649 (noise), and the full arena (7.65 GiB) deadlocks in the engine's next-turn background prefill after the
+  first request. The prompt path is dominated by the EXL3 expert kernels, not the dense linears. Off by default; the
+  numbers and the hang are in docs/thor.md.
+
+- **2026-11-04** -- **Jetson AGX Thor.** The recipe runs on two Thor nodes as well as on two Sparks, without being told
+  which: `SM` defaults to empty and is read from the driver (`sm_110` on Thor, `sm_121` on a GB10), so the image, its
+  tag and its kernels follow the GPU. Thor exposes no RDMA device (its 100G QSFP cage is Ethernet on the SoC's MGBE
+  controllers), so `scripts/nodes.sh` finds the rails by address and MTU (`fabric_pairs`, `FABRIC_MIN_SPEED_MBPS`),
+  probes each with a full-size unfragmentable ping, and hands NCCL the whole list as `NCCL_SOCKET_IFNAME` with
+  `NCCL_IB_DISABLE=1`; `ROCE=auto` turns the engine's RDMA all-gathers off when neither node has a verbs device, and no
+  `--device /dev/infiniband` is added. `GPU_RUNTIME=auto` picks `--runtime=nvidia` where the daemon registers one
+  (JetPack refuses `--gpus`) and `--gpus all` where it does not (DGX OS), per node. `cuda_compat_args` moves an image's
+  `NVIDIA_REQUIRE_CUDA` floor down to the driver's own CUDA version when the driver is older (JetPack 7.2 reports 13.2
+  against an image built on 13.3.1), keeping the image's other requirements. `docs/thor.md` is the port's page; the
+  GLM/EXL3 kernel suites and a two-rank NCCL exchange pass on `sm_110`.
+
 - **2026-11-04** -- `WORKER_WEIGHTS=check` accepts a local checkpoint with no `.revision` marker when its config.json
   and shards are there, as `worker_weights_ready`'s comment always said; `MODEL_REVISION`'s default made the marker
   mandatory even for `MODEL_SOURCE=local` (issue 3, failure 1). The `E_WEIGHTS` hint names the marker.

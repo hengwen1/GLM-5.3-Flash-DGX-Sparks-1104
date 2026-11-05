@@ -23,8 +23,27 @@ at_least() { python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(s
 # shellcheck source=scripts/nodes.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/nodes.sh"
 
+# The GPU's compute capability as the engine's -Dsm: 121 on a GB10 (DGX Spark), 110 on a Jetson AGX Thor. Empty or
+# auto asks the driver on this node; an explicit SM wins (comma-separated lists are the engine's own syntax).
+detect_sm() {
+  local cc
+  cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+  [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s\n' "${cc//./}"
+}
+resolve_arch() {
+  [[ -z "$SM" || "$SM" == auto ]] || return 0
+  local detected
+  if detected=$(detect_sm); then SM=$detected
+  else
+    SM=121
+    warn W_SM "Cannot read the GPU's compute capability; building for sm_121 (the engine's default). Set SM to override."
+  fi
+}
+
 validate_config() {
   local key path
+  resolve_arch
   [[ "$DRY_RUN" =~ ^[01]$ ]] || fail E_CONFIG 'DRY_RUN must be 0 or 1.'
   [[ "$MODEL_SOURCE" =~ ^(local|download)$ ]] || fail E_CONFIG 'MODEL_SOURCE must be local or download.'
   [[ "$DRAFTER" =~ ^(dflash2|mtp|none)$ ]] || fail E_CONFIG 'DRAFTER must be dflash2, mtp or none.'
@@ -62,7 +81,9 @@ validate_config() {
     || fail E_CONFIG 'MEMORY_RESERVE_GIB must be a number of GiB, at least 2 (the engine floor on a unified-memory device).'
   [[ -z "$HOST_CACHE_GIB" || "$HOST_CACHE_GIB" == auto ]] || is_number "$HOST_CACHE_GIB" \
     || fail E_CONFIG 'HOST_CACHE_GIB must be a number of GiB, 0 (off), auto or empty (TF_GLM_HOST_CACHE_GIB).'
-  [[ "$ROCE" =~ ^(on|off)$ ]] || fail E_CONFIG 'ROCE must be on or off (TF_ROCE).'
+  [[ "$ROCE" =~ ^(on|off|auto)$ ]] || fail E_CONFIG 'ROCE must be on, off or auto (TF_ROCE).'
+  [[ "$GPU_RUNTIME" =~ ^(auto|gpus|runtime)$ ]] || fail E_CONFIG 'GPU_RUNTIME must be auto, gpus or runtime.'
+  [[ "$FABRIC_MIN_SPEED_MBPS" =~ ^[0-9]+$ ]] || fail E_CONFIG 'FABRIC_MIN_SPEED_MBPS must be a link speed in Mb/s (0: no floor).'
   [[ "$MEMGUARD" =~ ^[01]$ ]] || fail E_CONFIG 'MEMGUARD must be 0 or 1.'
   is_number "$MEMGUARD_FLOOR_GIB" || fail E_CONFIG 'MEMGUARD_FLOOR_GIB must be a number of GiB.'
   for key in MEMGUARD_HOLD_S MEMGUARD_INTERVAL_S; do
@@ -97,7 +118,7 @@ validate_config() {
   done
   [[ -z "$TF_ROCE_HCA" || "$TF_ROCE_HCA" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || fail E_CONFIG 'TF_ROCE_HCA must be comma-separated RDMA device names.'
   [[ -z "$NCCL_IB_GID_INDEX" || "$NCCL_IB_GID_INDEX" =~ ^[0-9]+$ ]] || fail E_CONFIG 'NCCL_IB_GID_INDEX must be a number.'
-  [[ -z "$NCCL_SOCKET_IFNAME" || "$NCCL_SOCKET_IFNAME" =~ ^[A-Za-z0-9_.-]+$ ]] || fail E_CONFIG 'NCCL_SOCKET_IFNAME must be a netdev name.'
+  [[ -z "$NCCL_SOCKET_IFNAME" || "$NCCL_SOCKET_IFNAME" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]] || fail E_CONFIG 'NCCL_SOCKET_IFNAME must be a netdev name or a comma-separated list of them.'
   [[ "$CONTAINER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail E_CONFIG 'CONTAINER_NAME contains unsupported characters.'
   [[ "$CONTAINER_NAME" != tensorfold-zig-r0 && "$CONTAINER_NAME" != tensorfold-zig-r1 && "$CONTAINER_NAME" != dsv41-1017-exl3-tf ]] \
     || fail E_CONFIG "$CONTAINER_NAME is a DeepSeek recipe's container on these Sparks; give this one another CONTAINER_NAME."
@@ -146,8 +167,74 @@ set_image() {
 image_ready() { [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)" == "$PATCHES_HASH" ]]; }
 
 # Docker can hand a container the GPU. Two mechanisms are in the field and both are fine: an `nvidia` runtime
-# registered with the daemon, or the NVIDIA Container Toolkit's prestart hook, which `--gpus` uses with plain runc --
-# what DGX OS ships on a Spark, where `docker info` lists no nvidia runtime at all. Pass "worker" to check the worker.
+# registered with the daemon (JetPack on a Jetson AGX Thor, where `--gpus` is refused outright: "invoking the NVIDIA
+# Container Runtime Hook directly ... is not supported"), or the NVIDIA Container Toolkit's prestart hook, which
+# `--gpus` uses with plain runc -- what DGX OS ships on a Spark, where `docker info` lists no nvidia runtime at all.
+# Pass "worker" to ask the worker. GPU_RUNTIME picks one; auto prefers the registered runtime and falls back to
+# `--gpus`, so each node of a mixed pair gets the mechanism it supports.
+gpu_mode() {
+  local where=${1:-} runtimes
+  if [[ "$where" == worker ]]; then
+    runtimes=$(wssh docker info --format '{{json .Runtimes}}' 2>/dev/null || true)
+  else
+    runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null || true)
+  fi
+  case "$GPU_RUNTIME" in
+    runtime) echo runtime ;;
+    gpus) echo gpus ;;
+    *) [[ "$runtimes" == *'"nvidia"'* ]] && echo runtime || echo gpus ;;
+  esac
+}
+
+# gpu_args <local|worker>: the docker flags that give a container this node's GPU.
+gpu_args() {
+  case "$(gpu_mode "$1")" in
+    runtime) printf '%s\n' --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all ;;
+    *) printf '%s\n' --gpus all ;;
+  esac
+  cuda_compat_args "$1"
+}
+
+# The CUDA version a node's driver reports ("13.2" on JetPack 7.2 for a Thor).
+driver_cuda() {
+  local s
+  if [[ "$1" == worker ]]; then s=$(wssh nvidia-smi 2>/dev/null || true); else s=$(nvidia-smi 2>/dev/null || true); fi
+  sed -n 's/.*CUDA Version: *\([0-9][0-9.]*\).*/\1/p' <<< "$s" | head -1
+}
+
+# The CUDA floor an image asks the container runtime for (NVIDIA_REQUIRE_CUDA, e.g. "cuda>=13.3 brand=... driver>=595").
+image_cuda_require() {
+  local env
+  if [[ "$1" == worker ]]; then env=$(wssh docker image inspect -f '{{json .Config.Env}}' "$IMAGE" 2>/dev/null || true)
+  else env=$(docker image inspect -f '{{json .Config.Env}}' "$IMAGE" 2>/dev/null || true); fi
+  python3 -c 'import json, sys
+try: env = json.loads(sys.argv[1]) or []
+except Exception: sys.exit(0)
+print(next((e.split("=", 1)[1] for e in env if e.startswith("NVIDIA_REQUIRE_CUDA=")), ""))' "$env"
+}
+
+# cuda_compat_args <local|worker>: the NVIDIA container runtime refuses an image whose NVIDIA_REQUIRE_CUDA floor is
+# newer than the driver's CUDA version -- JetPack 7.2 on a Thor reports CUDA 13.2 (driver 595.78) against an image
+# built on nvidia/cuda:13.3.1, which asks for 13.3. CUDA 13.x minor version compatibility makes that run supported;
+# the toolkit's floor is the only thing in the way, so it is moved to the driver's own version and the image's other
+# requirements are kept. Nothing is passed when the driver is new enough.
+cuda_compat_args() {
+  local req drv out
+  req=$(image_cuda_require "$1"); drv=$(driver_cuda "$1")
+  [[ -n "$req" && -n "$drv" ]] || return 0
+  out=$(python3 - "$req" "$drv" <<'PY'
+import re, sys
+req, drv = sys.argv[1], sys.argv[2]
+m = re.search(r"cuda>=([0-9]+(?:\.[0-9]+)?)", req)
+if not m: sys.exit(0)
+key = lambda v: tuple(int(x) for x in v.split("."))
+if key(drv) >= key(m.group(1)): sys.exit(0)
+print(re.sub(r"cuda>=[0-9.]+", "cuda>=" + drv, req, count=1))
+PY
+  ) || true
+  [[ -z "$out" ]] || printf '%s\n' -e "NVIDIA_REQUIRE_CUDA=$out"
+}
+
 nvidia_docker_ready() {
   local where=${1:-} runtimes
   if [[ "$where" == worker ]]; then
@@ -166,7 +253,7 @@ nvidia_docker_ready() {
 
 check_platform() {
   local cmd
-  [[ "$(uname -s)" == Linux && "$(uname -m)" == aarch64 ]] || fail E_PLATFORM 'This recipe requires Linux aarch64 (DGX Spark, GB10).'
+  [[ "$(uname -s)" == Linux && "$(uname -m)" == aarch64 ]] || fail E_PLATFORM 'This recipe requires Linux aarch64 (DGX Spark GB10 or Jetson AGX Thor).'
   for cmd in docker curl python3 flock gzip tar sha256sum nvidia-smi ssh rsync ip awk; do
     command -v "$cmd" >/dev/null || fail E_DEPENDENCY "Missing command: $cmd. See README requirements."
   done
@@ -202,17 +289,18 @@ worker_home_defaults() {
   log "[I_WORKER] The logins differ ($whome there, $HOME here): the worker's state defaults to $WORKER_CACHE_DIR."
 }
 
-# One GB10 a Spark. nvidia-smi on GB10 answers [N/A] for memory.total, memory.used and memory.free and lists no
-# compute apps -- the GPU's memory *is* the host's -- so there is nothing to check on the device side beyond that a
-# GB10 is there and the driver answers. What another workload holds shows up in check_memory instead.
+# One GPU a node. nvidia-smi on a unified-memory device (GB10, Thor) answers [N/A] for memory.total, memory.used and
+# memory.free and lists no compute apps -- the GPU's memory *is* the host's -- so there is nothing to check on the
+# device side beyond that a supported GPU is there and the driver answers. What another workload holds shows up in
+# check_memory instead.
 check_gpu() {
   local names wnames
   names=$(nvidia-smi -L 2>/dev/null) || fail E_GPU 'Cannot list GPUs. Check the driver.'
-  [[ "$(grep -c '^GPU' <<< "$names")" == 1 ]] || warn W_GPU "This Spark lists $(grep -c '^GPU' <<< "$names") GPUs; rank 0 opens the first."
-  grep -q 'GB10' <<< "$names" || warn W_GPU "This Spark's GPU is not a GB10: $(head -1 <<< "$names")."
-  log "[I_GPU] rank 0: $(sed -n '1s/ (UUID.*//p' <<< "$names")."
+  [[ "$(grep -c '^GPU' <<< "$names")" == 1 ]] || warn W_GPU "This node lists $(grep -c '^GPU' <<< "$names") GPUs; rank 0 opens the first."
+  grep -Eq 'GB10|Thor' <<< "$names" || warn W_GPU "This node's GPU is not a GB10 or a Thor: $(head -1 <<< "$names")."
+  log "[I_GPU] rank 0: $(sed -n '1s/ (UUID.*//p' <<< "$names") (sm_$SM)."
   wnames=$(wssh nvidia-smi -L 2>/dev/null) || fail E_GPU "Cannot list GPUs on $(worker_host). Check its driver."
-  grep -q 'GB10' <<< "$wnames" || warn W_GPU "$(worker_host)'s GPU is not a GB10: $(head -1 <<< "$wnames")."
+  grep -Eq 'GB10|Thor' <<< "$wnames" || warn W_GPU "$(worker_host)'s GPU is not a GB10 or a Thor: $(head -1 <<< "$wnames")."
   log "[I_GPU] rank 1: $(sed -n '1s/ (UUID.*//p' <<< "$wnames") on $(worker_host)."
 }
 
@@ -461,37 +549,37 @@ prepare_weights() {
   fi
 }
 
-# The link between the Sparks: which ports carry it, which RDMA devices and GID index NCCL and the engine's RoCE path
-# will be given, and whether each side can open an RDMA device at all. Without /dev/infiniband or libibverbs the ranks
-# still run: every all-gather stays on NCCL, over the same ports, only more slowly.
+# The link between the nodes: which ports carry it, which RDMA devices and GID index NCCL and the engine's RoCE path
+# will be given, and -- when neither node has an RDMA device at all -- that NCCL's socket transport carries every
+# exchange over the rails instead. detect_link resolves the fabric kind and ROCE's auto value.
 check_link() {
   if [[ "$DRY_RUN" == 1 ]]; then
-    log 'Find the link: ip route get <worker>, then the port'"'"'s RDMA device and its RoCE v2 IPv4 GID index on both'
-    log 'Sparks; probe any second rail with a full-size unfragmentable ping before using it.'
+    log 'Find the link: the directly reached ports on both nodes, the RDMA devices and the RoCE v2 IPv4 GID index when'
+    log 'both expose one; probe every rail with a full-size unfragmentable ping before using it.'
     # Read-only probing, so the plan below prints the real addresses. Placeholders when the worker is out of reach.
     if [[ -n "$WORKER" ]] && worker_reachable; then
       detect_link
     else
-      LINK_SELF="<this Spark's link address>"; LINK_PEER="<the worker's link address>"
+      LINK_SELF="<this node's link address>"; LINK_PEER="<the worker's link address>"
       LINK_DEV='<link netdev>'; WORKER_DEV='<worker link netdev>'
       LINK_HCA='<rdma devices>'; WORKER_HCA='<worker rdma devices>'
       LINK_GID='<gid>'; WORKER_GID='<gid>'
+      LINK_KIND=$(rdma_present && echo ib || echo tcp)
       warn W_FABRIC "Cannot reach $WORKER over ssh, so the plan shows placeholders for the link."
     fi
-    log "Then NCCL_COMM_ID=$LINK_SELF:$NCCL_PORT, NCCL_SOCKET_IFNAME/NCCL_IB_HCA/NCCL_IB_GID_INDEX per rank,"
+    log "Then NCCL_COMM_ID=$LINK_SELF:$NCCL_PORT and the per-rank link variables ($([[ "${LINK_KIND:-ib}" == ib ]] && echo 'NCCL_SOCKET_IFNAME/NCCL_IB_HCA/NCCL_IB_GID_INDEX' || echo 'NCCL_SOCKET_IFNAME/NCCL_IB_DISABLE')),"
     log "TF_ROCE=$([[ "$ROCE" == on ]] && echo 1 || echo 0), TF_ROCE_MAX_KB=$ROCE_MAX_KB."
     return 0
   fi
   detect_link
-  local here there
-  here=$([[ -e /dev/infiniband ]] && echo yes || echo no)
-  there=$(wssh test -e /dev/infiniband >/dev/null 2>&1 && echo yes || echo no)
-  if [[ "$ROCE" == on && ( "$here" == no || "$there" == no ) ]]; then
-    warn W_ROCE "/dev/infiniband is missing on $([[ "$here" == no ]] && echo 'this Spark' || echo "$(worker_host)"): the ranks start, but every all-gather stays on NCCL. Install rdma-core on the host, or set ROCE=off to stop asking."
-  elif [[ "$ROCE" == on ]]; then
-    log "[I_ROCE] Both Sparks expose /dev/infiniband; the ranks will try the RoCE all-gather path (TF_ROCE_MAX_KB=$ROCE_MAX_KB) and fall back to NCCL together if either cannot bring it up."
+  if [[ "$LINK_KIND" == ib ]]; then
+    if [[ "$ROCE" == on ]]; then
+      log "[I_ROCE] Both nodes expose an RDMA device; the ranks will try the RoCE all-gather path (TF_ROCE_MAX_KB=$ROCE_MAX_KB) and fall back to NCCL together if either cannot bring it up."
+    else
+      log '[I_ROCE] ROCE=off: NCCL carries every exchange.'
+    fi
   else
-    log '[I_ROCE] ROCE=off: NCCL carries every exchange.'
+    log "[I_ROCE] No RDMA device on both nodes: NCCL's socket transport carries every exchange over $LINK_DEV <-> $WORKER_DEV (the engine's RoCE all-gathers are off)."
   fi
 }
 
@@ -499,7 +587,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   cd "$REPO_ROOT"
   mode=${1:-}
   case "$mode" in
-    --label) set_image; printf '%s\n' "$PATCHES_HASH"; exit 0 ;;
+    --label) resolve_arch; set_image; printf '%s\n' "$PATCHES_HASH"; exit 0 ;;  # resolve_arch: SM is in the hash
     ''|--image|--weights|--check) ;;
     -h|--help) sed -n '2,7s/^# //p' "$0"; exit 0 ;;
     *) printf 'Usage: scripts/prepare.sh [--image|--weights|--check|--label]\n' >&2; exit 2 ;;

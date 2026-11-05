@@ -1,8 +1,10 @@
-# TensorFold native (Zig) CUDA server for GLM-5.3-Flash EXL3 on NVIDIA DGX Spark (GB10, sm_121, aarch64).
+# TensorFold native (Zig) CUDA server for GLM-5.3-Flash EXL3 on aarch64 unified-memory nodes: a DGX Spark
+# (GB10, sm_121) or a Jetson AGX Thor (sm_110). SM is a build arg; the launcher passes the GPU's own value.
 #
-# One rank per Spark: this image runs on both, and the two ranks reach each other over the Sparks' ConnectX-7 link
-# (NCCL's IB transport, plus the engine's own RoCE all-gather path in zig/src/cuda/roce.zig). That path dlopens
-# libibverbs at run time, so the runtime stage carries rdma-core and the mlx5 provider.
+# One rank per node: this image runs on both, and the two ranks reach each other over the link between them -- NCCL's
+# IB transport plus the engine's own RoCE all-gather path in zig/src/cuda/roce.zig on a Spark's ConnectX-7, or NCCL's
+# socket transport over the rails on a Jetson AGX Thor, which has no verbs device. The RoCE path dlopens libibverbs at
+# run time, so the runtime stage carries rdma-core and the mlx5 provider.
 #
 # Build context: the recipe repository root (this file is docker/Dockerfile; patches/engine/*.patch are COPYed).
 #   docker build -f docker/Dockerfile \
