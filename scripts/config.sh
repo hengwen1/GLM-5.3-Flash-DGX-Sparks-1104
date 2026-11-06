@@ -85,12 +85,13 @@ SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash}"
 ROCE="${ROCE:-auto}"                            # auto: on when both nodes expose an RDMA device, else off
 ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest shard the RDMA region holds
 
-# TCP_GATHER=on: on a TCP fabric (no verbs device) the engine carries a prompt piece's all-gathers over the rails' own
+# TCP_GATHER=on: EXPERIMENTAL (not qualified). On a TCP fabric the engine carries a prompt piece's all-gathers over the rails' own
 # sockets (zig/src/cuda/tcp_gather.zig) instead of NCCL's, which uses one rail's worth of bandwidth (measured on this
 # pair: 16 MiB the same with one interface as with four). It stripes CONNS connections over the rails the launcher
-# found; the size alone decides, so both ranks take one path. auto: on when the link is TCP.
+# found; the size alone decides, so both ranks take one path. Off by default: the path is benchmarked (bench/tp_gather)
+# but not yet qualified end to end, and a prompt still fails on this pair (docs/thor.md).
 # off (TF_TCP_GATHER=0 on either rank): NCCL carries every gather.
-TCP_GATHER="${TCP_GATHER:-auto}"                # auto: on for a TCP fabric, off on RDMA
+TCP_GATHER="${TCP_GATHER:-off}"                 # off (default) until it is qualified on the pair; on: the rails' path
 TCP_GATHER_MIN_KB="${TCP_GATHER_MIN_KB:-2048}"  # TF_TCP_GATHER_MIN_KB: smaller gathers stay on NCCL
 TCP_GATHER_MAX_KB="${TCP_GATHER_MAX_KB:-32768}" # TF_TCP_GATHER_MAX_KB: a rank's largest shard
 TCP_GATHER_CONNS="${TCP_GATHER_CONNS:-8}"       # TF_TCP_GATHER_CONNS: connections, striped over the rails

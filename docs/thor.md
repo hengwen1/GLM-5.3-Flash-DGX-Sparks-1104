@@ -67,8 +67,11 @@ device-mapped staging buffer per stream, `TCP_GATHER_CONNS` sockets striped over
 `cuStreamWriteValue32`/`cuStreamWaitValue32` pairs with no host synchronize. The microbenchmark beside the port
 (`bench/tp_gather/`) measured 64 MiB a rank at 12.5 ms against NCCL's 48.2, 16 MiB at 4.5 against 12.2.
 
-It runs only when the launcher found a TCP fabric (`TCP_GATHER=auto`) and both ranks agreed at startup (the log line
-`TCP all-gather: N rail(s), ...` says it came up); `TCP_GATHER=off` puts every exchange back on NCCL. Small gathers
+**It is off by default and is not qualified.** The microbenchmark is clear about the wire (4.3x NCCL at 64 MiB) and
+the path comes up on the pair (`TCP all-gather: 4 rail(s), 8 connection(s), ...` on both ranks), but a real prompt is
+not right yet: a cold prompt past 2 MiB a piece wedges instead of finishing, and the current build aborts both ranks
+with `TCP all-gather failed: ...` rather than hanging. Enable it to reproduce with `TCP_GATHER=on TF_TCP_GATHER_DEBUG=1`
+(every job is logged on both ranks); `TCP_GATHER=off` is the served setting and puts every exchange on NCCL. Small gathers
 (decode, verify) always stay on NCCL (`TCP_GATHER_MIN_KB`). Because the path carries all-gathers, the launcher serves
 prompts in `PREFILL_REDUCE=gather` when it is on; split's point-to-point sends have no rail path. A connect failure
 or a silent peer turns the path off on both ranks and every later gather falls back to NCCL.
