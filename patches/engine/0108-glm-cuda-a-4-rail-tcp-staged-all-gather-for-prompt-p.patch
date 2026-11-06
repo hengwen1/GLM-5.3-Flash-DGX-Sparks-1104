@@ -33,10 +33,10 @@ index 147b70150..f4906f6bb 100644
      _ = @import("rank_scatter.zig");
 diff --git a/zig/src/cuda/tcp_gather.zig b/zig/src/cuda/tcp_gather.zig
 new file mode 100644
-index 000000000..1e05a4777
+index 000000000..2d073326d
 --- /dev/null
 +++ b/zig/src/cuda/tcp_gather.zig
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,591 @@
 +//! Two ranks on different hosts with no verbs device: the engine's large all-gathers over the rails' TCP sockets.
 +//!
 +//! NCCL's socket transport on a Jetson AGX Thor pair carries an exchange on effectively one rail (measured: the same
@@ -303,9 +303,12 @@ index 000000000..1e05a4777
 +            const rc = std.c.poll(@ptrCast(&fds), @intCast(n), 1000);
 +            if (rc < 0) return error.Setup;
 +            if (!x.running.load(.acquire)) return error.Stopped;
-+            ticks += 1;
-+            if (ticks > x.timeout_s) return error.Setup; // a second a tick: the peer fell silent
-+            if (rc == 0) continue;
++            if (rc == 0) { // idle: a second a tick. Progress resets the budget, so a busy exchange never times out.
++                ticks += 1;
++                if (ticks > x.timeout_s) return error.Setup;
++                continue;
++            }
++            ticks = 0;
 +            for (0..n) |k| {
 +                const revents = fds[k].revents;
 +                if (revents == 0) continue;
@@ -342,7 +345,10 @@ index 000000000..1e05a4777
 +            if (s.got_header == header_bytes) { // the header is in: it must be this exchange's
 +                const got_id = std.mem.readInt(u64, s.recv_header[0..8], .big);
 +                const got_len = std.mem.readInt(u64, s.recv_header[8..16], .big);
-+                if (got_id != id or got_len != peer.len) return error.Setup;
++                if (got_id != id or got_len != peer.len) {
++                    std.log.err("TCP all-gather: stripe {d} on connection {d} got exchange {d} of {d} bytes, wanted {d} of {d}", .{ s.send_end - s.send_at, s.fd, got_id, got_len, id, peer.len });
++                    return error.Setup;
++                }
 +            }
 +        }
 +        while (s.recv_at < s.recv_end) {
