@@ -1,5 +1,11 @@
 # Changelog
 
+- **2026-11-06** -- **Thor: the rails' own all-gathers for prompt pieces** (`TCP_GATHER`, patch 0108). NCCL's socket transport uses one
+  MGBE rail's bandwidth however many it lists; the engine now stripes a prompt piece's all-gathers over all four by
+  its own sockets (measured 64 MiB a rank at 12.5 ms against NCCL's 48.2; `bench/tp_gather/` is the benchmark).
+  Both ranks must agree at startup, small gathers stay on NCCL, and any connect or exchange failure falls back to
+  NCCL on both ranks. Prompts are served in `PREFILL_REDUCE=gather` while it is on (split's point-to-point sends
+  have no rail path).
 - **2026-11-05** -- **`TF_GLM_MM_CUBLAS`** (patch 0107, opt-in, **off**): a prompt's dense linears through cuBLASLt,
   which dispatches the 5th-gen tensor core (tcgen05/TMEM) a Jetson AGX Thor's SM has and the engine's `mma.sync` kernels
   cannot reach. It works, and it is not worth its memory here: five fresh 2,547-token prompts read 651 tok/s against the

@@ -193,6 +193,7 @@ cx7_peer() {
 
 # Filled by detect_link: this node's and the worker's side of the link.
 LINK_SELF= LINK_PEER= LINK_DEV= LINK_HCA= LINK_GID=
+RAIL_SELF_IPS= RAIL_PEER_IPS=
 WORKER_DEV= WORKER_HCA= WORKER_GID=
 LINK_KIND=''                                     # ib (NCCL over verbs) or tcp (NCCL's socket transport)
 # detect_link: FABRIC_PEER / FABRIC_SELF / NCCL_SOCKET_IFNAME / TF_ROCE_HCA / NCCL_IB_GID_INDEX, each kept when it was
@@ -260,6 +261,9 @@ detect_link_tcp() {
   (( ${#keep[@]} )) || fail E_FABRIC "No rail between this node and $(worker_host) carries a full-size ping. Check the cables, both sides' addresses and MTU, or set FABRIC_PEER."
   LINK_KIND=tcp
   LINK_HCA='' WORKER_HCA='' LINK_GID='' WORKER_GID=''
+  # The rails' own addresses, in the order NCCL was given them: the engine's TCP all-gathers stripe over the same set.
+  RAIL_SELF_IPS=$(printf '%s\n' "${keep[@]}" | awk '{ print $2 }' | paste -sd, -)
+  RAIL_PEER_IPS=$(printf '%s\n' "${keep[@]}" | awk '{ print $4 }' | paste -sd, -)
   if [[ -n "$NCCL_SOCKET_IFNAME" ]]; then
     LINK_DEV=$NCCL_SOCKET_IFNAME
     WORKER_DEV=$(printf '%s\n' "${keep[@]}" | awk -v d="$NCCL_SOCKET_IFNAME" '$1 == d { print $3 }' | paste -sd, -)

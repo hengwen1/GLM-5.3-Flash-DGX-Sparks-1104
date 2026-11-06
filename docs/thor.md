@@ -57,6 +57,22 @@ Nothing is required. These are the ones worth knowing:
 `WORKER=test@192.168.100.39` (a rail) and `WORKER=test@192.168.2.39` (the LAN) both work — the rail is faster for the
 image and the weights.
 
+## The rails' own all-gathers (TCP_GATHER)
+
+NCCL's socket transport stripes its channels over the four MGBE rails but carries an exchange on one rail's worth of
+bandwidth (measured on this pair: a 16 MiB all-gather costs the same with `NCCL_SOCKET_IFNAME=mgbe0_0` as with all
+four; a raw TCP stream reaches 1.28 GB/s, which is what NCCL's 2.8 GB/s wire rate is for a two-way exchange). Patch
+0108 adds the engine's own path for a prompt piece's all-gathers (`zig/src/cuda/tcp_gather.zig`): a pinned,
+device-mapped staging buffer per stream, `TCP_GATHER_CONNS` sockets striped over the rails, and stream order kept by
+`cuStreamWriteValue32`/`cuStreamWaitValue32` pairs with no host synchronize. The microbenchmark beside the port
+(`bench/tp_gather/`) measured 64 MiB a rank at 12.5 ms against NCCL's 48.2, 16 MiB at 4.5 against 12.2.
+
+It runs only when the launcher found a TCP fabric (`TCP_GATHER=auto`) and both ranks agreed at startup (the log line
+`TCP all-gather: N rail(s), ...` says it came up); `TCP_GATHER=off` puts every exchange back on NCCL. Small gathers
+(decode, verify) always stay on NCCL (`TCP_GATHER_MIN_KB`). Because the path carries all-gathers, the launcher serves
+prompts in `PREFILL_REDUCE=gather` when it is on; split's point-to-point sends have no rail path. A connect failure
+or a silent peer turns the path off on both ranks and every later gather falls back to NCCL.
+
 ## Checking it
 
 ```sh

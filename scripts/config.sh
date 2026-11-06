@@ -85,6 +85,19 @@ SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash}"
 ROCE="${ROCE:-auto}"                            # auto: on when both nodes expose an RDMA device, else off
 ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest shard the RDMA region holds
 
+# TCP_GATHER=on: on a TCP fabric (no verbs device) the engine carries a prompt piece's all-gathers over the rails' own
+# sockets (zig/src/cuda/tcp_gather.zig) instead of NCCL's, which uses one rail's worth of bandwidth (measured on this
+# pair: 16 MiB the same with one interface as with four). It stripes CONNS connections over the rails the launcher
+# found; the size alone decides, so both ranks take one path. auto: on when the link is TCP.
+# off (TF_TCP_GATHER=0 on either rank): NCCL carries every gather.
+TCP_GATHER="${TCP_GATHER:-auto}"                # auto: on for a TCP fabric, off on RDMA
+TCP_GATHER_MIN_KB="${TCP_GATHER_MIN_KB:-2048}"  # TF_TCP_GATHER_MIN_KB: smaller gathers stay on NCCL
+TCP_GATHER_MAX_KB="${TCP_GATHER_MAX_KB:-32768}" # TF_TCP_GATHER_MAX_KB: a rank's largest shard
+TCP_GATHER_CONNS="${TCP_GATHER_CONNS:-8}"       # TF_TCP_GATHER_CONNS: connections, striped over the rails
+TCP_GATHER_PORT="${TCP_GATHER_PORT:-30680}"     # TF_TCP_GATHER_PORT: the first port (CONNS a stream)
+# The rails' path carries all-gather prompt exchanges, so a TCP fabric serves prompts in PREFILL_REDUCE=gather
+# (split's point-to-point sends stay on NCCL's single socket); the launcher sets it when TCP_GATHER is on.
+
 # --- four Sparks (./start-tp4.sh, ./stop-tp4.sh; README "4 Sparks") -----------------------------------------------------
 # TP=4 over four Sparks cabled as a ring without a switch: this Spark (rank 0, the API) and WORKER, WORKER2, WORKER3
 # (ranks 1-3) in the ring's order, each cabled to the next and the last back to this one, one subnet per cable. The two

@@ -141,7 +141,7 @@ WORKER_ENV_FILE=''
 MANAGED_ENV=' HOME HF_HUB_OFFLINE CUDA_DEVICE_ORDER CUDA_VISIBLE_DEVICES TENSORFOLD_NO_UPDATE_CHECK TENSORFOLD_NO_LIVE
  TENSORFOLD_MEMORY_RESERVE_GIB TF_GLM_DENSE_BITS TF_GLM_HEAD_BITS TF_GLM_CLEAR_THINKING TF_GLM_RANK TF_GLM_WORLD TF_CUDA_DEVICE
  TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET
- TF_ROCE TF_ROCE_MAX_KB TF_ROCE_HCA TF_BIN TF_REPO TF_REF
+ TF_ROCE TF_ROCE_MAX_KB TF_ROCE_HCA TF_GLM_PREFILL_REDUCE TF_TCP_GATHER TF_TCP_GATHER_MIN_KB TF_TCP_GATHER_MAX_KB TF_TCP_GATHER_CONNS TF_TCP_GATHER_PORT TF_BIN TF_REPO TF_REF
  NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS '
 # The flags both ranks share. Everything that places a rank is added per rank, so the two fingerprints agree on the rest.
 build_env_args() {
@@ -194,6 +194,21 @@ rank_env_args() {
     [[ "$ROCE" != on ]] || RANK_ENV+=(-e "TF_ROCE_HCA=$hca")
   else
     RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=$dev" -e "NCCL_IB_DISABLE=1")
+    # The engine's own 4-rail TCP all-gathers for prompt pieces (zig/src/cuda/tcp_gather.zig): the rails' addresses,
+    # this rank's first. Both ranks must ask; the size alone decides the path, so the two agree on every gather.
+    RANK_ENV+=(-e "TF_TCP_GATHER=$([[ "$TCP_GATHER" == off ]] && echo 0 || echo 1)"
+      -e "TF_TCP_GATHER_MIN_KB=$TCP_GATHER_MIN_KB" -e "TF_TCP_GATHER_MAX_KB=$TCP_GATHER_MAX_KB"
+      -e "TF_TCP_GATHER_CONNS=$TCP_GATHER_CONNS" -e "TF_TCP_GATHER_PORT=$TCP_GATHER_PORT")
+    # Gather-mode prompt exchanges are all-gathers, which is the exchange the rails' TCP path carries; split's
+    # point-to-point sends have no rail path (one NCCL socket, measured). So a TCP fabric serves prompts in gather.
+    [[ "$TCP_GATHER" == off ]] || RANK_ENV+=(-e "TF_GLM_PREFILL_REDUCE=$PREFILL_REDUCE")
+    if [[ -n "${RAIL_SELF_IPS:-}" && -n "${RAIL_PEER_IPS:-}" ]]; then
+      if (( r == 0 )); then
+        RANK_ENV+=(-e "TF_TCP_GATHER_RAILS=$RAIL_SELF_IPS" -e "TF_TCP_GATHER_PEER_RAILS=$RAIL_PEER_IPS")
+      else
+        RANK_ENV+=(-e "TF_TCP_GATHER_RAILS=$RAIL_PEER_IPS" -e "TF_TCP_GATHER_PEER_RAILS=$RAIL_SELF_IPS")
+      fi
+    fi
   fi
   RANK_ENV+=(-e "NCCL_MIN_NCHANNELS=$NCCL_CHANNELS" -e "NCCL_MAX_NCHANNELS=$NCCL_CHANNELS")
 }
