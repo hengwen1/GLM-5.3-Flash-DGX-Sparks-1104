@@ -33,10 +33,10 @@ index 147b70150..f4906f6bb 100644
      _ = @import("rank_scatter.zig");
 diff --git a/zig/src/cuda/tcp_gather.zig b/zig/src/cuda/tcp_gather.zig
 new file mode 100644
-index 000000000..d008436e2
+index 000000000..8b272a3ef
 --- /dev/null
 +++ b/zig/src/cuda/tcp_gather.zig
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,624 @@
 +//! Two ranks on different hosts with no verbs device: the engine's large all-gathers over the rails' TCP sockets.
 +//!
 +//! NCCL's socket transport on a Jetson AGX Thor pair carries an exchange on effectively one rail (measured: the same
@@ -251,7 +251,10 @@ index 000000000..d008436e2
 +            }
 +            const job = x.jobs[x.head.load(.monotonic) % depth];
 +            x.head.store(x.head.load(.monotonic) + 1, .release);
-+            if (x.debug) std.log.info("tcp-gather: job {d} start, {d} KiB, slot {d}, seq {d}", .{ job.id, job.bytes >> 10, job.slot, job.seq });
++            if (x.debug) {
++                const words: [*]const u32 = @ptrCast(@alignCast(x.flags.bytes.ptr));
++                std.log.info("tcp-gather: job {d} start, {d} KiB, slot {d}, seq {d}, flags done={d} ready[0..{d}]={any}", .{ job.id, job.bytes >> 10, job.slot, job.seq, words[0], x.n_slots, x.seqs[0..x.n_slots] });
++            }
 +
 +            const host = x.host.bytes[0..job.bytes];
 +            const peer = x.host.bytes[x.cap .. x.cap + job.bytes];
@@ -324,6 +327,13 @@ index 000000000..d008436e2
 +            if (!x.running.load(.acquire)) return error.Stopped;
 +            if (rc == 0) { // idle: a second a tick. Progress resets the budget, so a busy exchange never times out.
 +                ticks += 1;
++                if (x.debug and ticks % 5 == 0) {
++                    std.log.warn("tcp-gather: job {d} idle {d}s, {d} stripe(s) active", .{ id, ticks, n });
++                    for (stripes[0..x.conns], 0..) |st, k| {
++                        if (!st.sending and !st.receiving) continue;
++                        std.log.warn("tcp-gather:   conn {d}: send {d}/{d} (+{d} hdr), recv hdr {d}, recv {d}/{d} [{d}-{d}]", .{ k, st.send_at - st.send_end + (st.send_end - st.send_at), st.send_end - st.send_at, st.sent_header, st.got_header, st.recv_at, st.recv_end - st.recv_at, st.recv_at, st.recv_end });
++                    }
++                }
 +                if (ticks > x.timeout_s) return error.Setup;
 +                continue;
 +            }
@@ -470,6 +480,7 @@ index 000000000..d008436e2
 +        };
 +        keep = true;
 +        std.log.info("TCP all-gather: {d} rail(s), {d} connection(s), shards {d}-{d} KiB over the rails", .{ x.n_rails, x.conns, x.min_bytes >> 10, x.cap >> 10 });
++        if (x.debug) std.log.info("tcp-gather: flags at 0x{x} (done) and 0x{x}.. (ready), host 0x{x}, net stream 0x{x}", .{ x.flags_dev, x.flags_dev + 4, @intFromPtr(x.host.bytes.ptr), @intFromPtr(x.net.handle) });
 +        return x;
 +    }
 +
