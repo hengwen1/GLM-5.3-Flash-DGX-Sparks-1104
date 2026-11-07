@@ -580,6 +580,7 @@ check_link() {
     fi
   else
     log "[I_ROCE] No RDMA device on both nodes: NCCL's socket transport carries every exchange over $LINK_DEV <-> $WORKER_DEV (the engine's RoCE all-gathers are off)."
+    rail_tcp_buffers
   fi
 }
 

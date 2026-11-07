@@ -68,7 +68,9 @@ node_addrs() {
 }
 
 # fabric_pairs: the rails between this node and the worker, one per line: "<netdev> <address> <worker netdev>
-# <worker address> <mtu>". A rail is a pair of addresses in one subnet on both nodes at or above FABRIC_MIN_SPEED_MBPS,
+# <worker address> <mtu> <mtu here>/<mtu on the worker>". The fifth field is the smaller of the two MTUs, the size
+# the rail is probed at; the sixth says whether the two sides agree. A rail is a pair of addresses in one subnet on
+# both nodes at or above FABRIC_MIN_SPEED_MBPS,
 # so a 1G/5G management LAN beside the 100G cage is left out. NCCL pairs its own interfaces with the peer's on the
 # same subnet, so listing every rail as NCCL_SOCKET_IFNAME stripes the channels across them.
 fabric_pairs() {
@@ -96,7 +98,7 @@ for dev, ip, pfx, mtu, _ in mine:
     for wdev, wip, wpfx, wmtu, _ in theirs:
         wn, wa = net(wip, wpfx), addr(wip)
         if wn is None or wa is None or la not in wn or wa not in ln: continue
-        print(dev, ip, wdev, wip, min(int(mtu), int(wmtu)))
+        print(dev, ip, wdev, wip, min(int(mtu), int(wmtu)), f"{mtu}/{wmtu}")
 '
 }
 
@@ -176,6 +178,24 @@ rail_info() {
 # another port) fails here instead of as vendor_err 0x81 in the first all-gather. Self-contained.
 rail_ping() { ping -c2 -W2 -I "$1" -M do -s $(( $3 - 28 )) "$2" >/dev/null 2>&1; }
 
+# tcp_buffer_ceiling: the smaller of this node's net.core.rmem_max and net.core.wmem_max, in bytes (0 when unreadable).
+# Self-contained: it is sent to the worker as text.
+tcp_buffer_ceiling() {
+  sysctl -n net.core.rmem_max net.core.wmem_max 2>/dev/null | sort -n | head -1
+}
+
+# rail_tcp_buffers: the qualified four-rail profile raises the kernel's socket buffer ceiling to 16 MiB on both nodes
+# before the rails carry TCP; NCCL's socket transport and the engine's own all-gathers are both bounded by it. This is
+# read-only (raising it needs root): it says what to run, on which node, instead of leaving a low ceiling to be read
+# as wire loss.
+rail_tcp_buffers() {
+  local here there
+  here=$(tcp_buffer_ceiling || true); here=${here:-0}
+  there=$(wfn tcp_buffer_ceiling -- "tcp_buffer_ceiling" 2>/dev/null || true); there=${there:-0}
+  (( here >= RAIL_TCP_BUFFER_BYTES && there >= RAIL_TCP_BUFFER_BYTES )) && return 0
+  warn W_TCP_BUFFER "The socket buffer ceiling is $here bytes here and $there on $(worker_host); the rails want $RAIL_TCP_BUFFER_BYTES on both. Raise it before a start: sudo sysctl -w net.core.rmem_max=$RAIL_TCP_BUFFER_BYTES net.core.wmem_max=$RAIL_TCP_BUFFER_BYTES (on this node and on $(worker_host))."
+}
+
 # cx7_peer: the worker's address on one of its link ports that a port of this node reaches directly (same subnet, no
 # gateway). Empty when there is none, which means the pair is not cabled to each other. On an RDMA fabric only the
 # verbs ports count; on TCP any port at or above FABRIC_MIN_SPEED_MBPS does (see fabric_pairs).
@@ -241,13 +261,16 @@ detect_link() {
 # them; NCCL_SOCKET_IFNAME takes the whole list.
 detect_link_tcp() {
   local -a keep=() rail=()
-  local dev ip wdev wip mtu ok first=1
+  local dev ip wdev wip mtu mtus ok first=1
   local -a pairs=()
   mapfile -t pairs < <(fabric_pairs)
   (( ${#pairs[@]} )) || fail E_FABRIC "Found no port at or above ${FABRIC_MIN_SPEED_MBPS} Mb/s that reaches $(worker_host) directly (no gateway). Cable the two nodes on one subnet and give both sides an address, or lower FABRIC_MIN_SPEED_MBPS."
   for rail in "${pairs[@]}"; do
-    read -r dev ip wdev wip mtu <<< "$rail"
+    read -r dev ip wdev wip mtu mtus <<< "$rail"
     [[ -z "$FABRIC_PEER" || "$wip" == "$FABRIC_PEER" ]] || continue
+    # The probe runs at the smaller MTU, so a mismatch still passes; say so instead of leaving it to a slow rail.
+    [[ -z "$mtus" || "${mtus%%/*}" == "${mtus##*/}" ]] || \
+      warn W_FABRIC "Rail $dev ($ip) is MTU ${mtus%%/*} and $wdev ($wip) on $(worker_host) is MTU ${mtus##*/}: the rail is probed at $mtu. Set both to the same MTU (the cage is 9000 here)."
     ok=1
     rail_ping "$dev" "$wip" "$mtu" || ok=0
     (( ok == 0 )) || wfn rail_ping -- "rail_ping $(printf '%q' "$wdev") $(printf '%q' "$ip") $mtu" || ok=0
@@ -261,9 +284,19 @@ detect_link_tcp() {
   (( ${#keep[@]} )) || fail E_FABRIC "No rail between this node and $(worker_host) carries a full-size ping. Check the cables, both sides' addresses and MTU, or set FABRIC_PEER."
   LINK_KIND=tcp
   LINK_HCA='' WORKER_HCA='' LINK_GID='' WORKER_GID=''
-  # The rails' own addresses, in the order NCCL was given them: the engine's TCP all-gathers stripe over the same set.
-  RAIL_SELF_IPS=$(printf '%s\n' "${keep[@]}" | awk '{ print $2 }' | paste -sd, -)
-  RAIL_PEER_IPS=$(printf '%s\n' "${keep[@]}" | awk '{ print $4 }' | paste -sd, -)
+  # The rails' own addresses, in the order NCCL was given them: the engine's TCP all-gathers stripe over the same set,
+  # and hold at most four (zig/src/cuda/tcp_gather.zig max_rails). Past four, the first four are the engine's; NCCL
+  # keeps every rail it was given.
+  local -a self_ips=() peer_ips=()
+  mapfile -t self_ips < <(printf '%s\n' "${keep[@]}" | awk '{ print $2 }')
+  mapfile -t peer_ips < <(printf '%s\n' "${keep[@]}" | awk '{ print $4 }')
+  if (( ${#self_ips[@]} > 4 )); then
+    warn W_FABRIC "Found ${#self_ips[@]} rails; the engine's TCP all-gather path holds four, so it uses the first four (NCCL keeps all ${#self_ips[@]})."
+    self_ips=("${self_ips[@]:0:4}")
+    peer_ips=("${peer_ips[@]:0:4}")
+  fi
+  RAIL_SELF_IPS=$(printf '%s\n' "${self_ips[@]}" | paste -sd, -)
+  RAIL_PEER_IPS=$(printf '%s\n' "${peer_ips[@]}" | paste -sd, -)
   if [[ -n "$NCCL_SOCKET_IFNAME" ]]; then
     LINK_DEV=$NCCL_SOCKET_IFNAME
     WORKER_DEV=$(printf '%s\n' "${keep[@]}" | awk -v d="$NCCL_SOCKET_IFNAME" '$1 == d { print $3 }' | paste -sd, -)

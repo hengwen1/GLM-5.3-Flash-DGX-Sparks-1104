@@ -61,20 +61,34 @@ image and the weights.
 
 NCCL's socket transport stripes its channels over the four MGBE rails but carries an exchange on one rail's worth of
 bandwidth (measured on this pair: a 16 MiB all-gather costs the same with `NCCL_SOCKET_IFNAME=mgbe0_0` as with all
-four; a raw TCP stream reaches 1.28 GB/s, which is what NCCL's 2.8 GB/s wire rate is for a two-way exchange). Patch
-0108 adds the engine's own path for a prompt piece's all-gathers (`zig/src/cuda/tcp_gather.zig`): a pinned,
-device-mapped staging buffer per stream, `TCP_GATHER_CONNS` sockets striped over the rails, and stream order kept by
-`cuStreamWriteValue32`/`cuStreamWaitValue32` pairs with no host synchronize. The microbenchmark beside the port
-(`bench/tp_gather/`) measured 64 MiB a rank at 12.5 ms against NCCL's 48.2, 16 MiB at 4.5 against 12.2.
+four; a raw TCP stream reaches 1.28 GB/s, which is what NCCL's 2.8 GB/s wire rate is for a two-way exchange). The
+engine's own path for a prompt piece's all-gathers (`zig/src/cuda/tcp_gather.zig`, patches 0108-0109) spreads the
+exchange over `TCP_GATHER_CONNS` sockets striped `i % rails`, each bound to its own rail's address (rank 0 listens
+and checks the peer's address, rank 1 dials from the rail's). The microbenchmark beside the port (`bench/tp_gather/`)
+measured 64 MiB a rank at 12.5 ms against NCCL's 48.2, 16 MiB at 4.5 against 12.2.
 
-**It is off by default and is not qualified.** The microbenchmark is clear about the wire (4.3x NCCL at 64 MiB) and
-the path comes up on the pair (`TCP all-gather: 4 rail(s), 8 connection(s), ...` on both ranks), but a real prompt is
-not right yet: a cold prompt past 2 MiB a piece wedges instead of finishing, and the current build aborts both ranks
-with `TCP all-gather failed: ...` rather than hanging. Enable it to reproduce with `TCP_GATHER=on TF_TCP_GATHER_DEBUG=1`
-(every job is logged on both ranks); `TCP_GATHER=off` is the served setting and puts every exchange on NCCL. Small gathers
-(decode, verify) always stay on NCCL (`TCP_GATHER_MIN_KB`). Because the path carries all-gathers, the launcher serves
-prompts in `PREFILL_REDUCE=gather` when it is on; split's point-to-point sends have no rail path. A connect failure
-or a silent peer turns the path off on both ranks and every later gather falls back to NCCL.
+**The exchange runs on the calling thread, in the Thor EXL3 backend's prefill-transport shape (MGBE-RAILS), rails and all.**
+The rail set is the reference's qualified profile: with four rails discovered, rails 0, 2 and 3 serve (`rails = [0, 2, 3]`
+in its prefill.py; the fourth is connected and verified but idle), and a smaller topology serves every rail. 32
+connections stripe `i % rails`, 8 a rail, each bound to its own rail's address (rank 0 listens and checks the peer's
+address, rank 1 dials from the rail's); the stripes tile the 24 serving connections. Patch 0108's first cut staged
+gathers asynchronously through device flag words, and that wedged on a cold prompt: the caller's stream owed the
+worker a ready word while it also carried the prompt path's NCCL collectives, and the two ranks gated each other into
+a stop (reproduced: job 29 of the first prompt, both ranks parked in a copy-stream wait, no socket ever idle, no
+timeout ever reached -- the flags, not the wire). Since 0109 the gather is synchronous on the calling CPU between the
+pipeline's steps -- stage down ordered after the producer by an event, stripe over the connections, copy back ordered
+before the caller's next work by an event -- so no GPU stream waits on a value another thread writes, and an exchange
+that stalls is bounded by its poll-tick budget (`TCP_GATHER_TIMEOUT_S`) instead of parking a stream forever: the
+failed exchange above stopped both ranks with `TCP all-gather failed: exchange: Setup` after 60 s, loudly. Patterned
+round trips at several sizes prove the wire before the first gather (`tcp-gather: round trip ... KiB in ... ms`
+under `TF_TCP_GATHER_DEBUG=1`, which also logs every exchange).
+
+Small gathers (decode, verify) always stay on NCCL (`TCP_GATHER_MIN_KB`). Because the path carries all-gathers, the
+launcher serves prompts in `PREFILL_REDUCE=gather` when it is on; split's point-to-point sends have no rail path. A
+connect failure, a failed round trip or a silent peer turns the path off on both ranks and every later gather falls
+back to NCCL. The qualified profile also raises the kernel's socket buffers to 16 MiB on both nodes
+(`net.core.rmem_max`/`wmem_max`, as the DS deployment's `prepare_tcp_buffers` does); `start.sh` warns with the command
+while they are low.
 
 ## Checking it
 

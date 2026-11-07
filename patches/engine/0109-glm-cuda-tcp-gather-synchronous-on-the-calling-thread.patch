@@ -1,0 +1,523 @@
+diff --git a/zig/src/cuda/tcp_gather.zig b/zig/src/cuda/tcp_gather.zig
+--- a/zig/src/cuda/tcp_gather.zig
++++ b/zig/src/cuda/tcp_gather.zig
+@@ -2,15 +2,21 @@
+ //!
+ //! NCCL's socket transport on a Jetson AGX Thor pair carries an exchange on effectively one rail (measured: the same
+ //! 16 MiB gather with one interface and with four). This path spreads it over every rail the launcher found, in the
+-//! shape the Thor EXL3 backend's prefill_transport.py uses: one pinned, device-mapped staging buffer and
+-//! TF_TCP_GATHER_CONNS TCP connections striped over the rails (i % rails).
++//! shape the Thor EXL3 backend's prefill_transport.py uses (MGBE-RAILS): TF_TCP_GATHER_CONNS TCP connections striped
++//! over the rails (i % rails), each bound to its own rail's address, and a gather that runs on the calling thread,
++//! between the pipeline's steps -- no GPU stream ever waits on a value another thread writes.
+ //!
+-//! One connection set serves every stream: jobs run through one FIFO, so the k-th TCP exchange on one rank meets the
+-//! k-th on the other, as NCCL's own collectives pair by issue order. Per-stream ordering is kept without a host
+-//! synchronize: the caller orders its producer with a 32-bit value on its own stream (cuStreamWriteValue32 into this
+-//! rank's ready word), the worker waits it on its copy stream (cuStreamWaitValue32), and the worker publishes
+-//! completion into the global done word the same way. Every value only grows, so nothing is re-recorded behind a
+-//! waiter. It is meant for prompt pieces (MiBs); TF_TCP_GATHER_MIN_KB keeps decode's small gathers on NCCL.
++//! The first cut of this path staged gathers asynchronously through device flag words (a ready word the caller's
++//! stream owed, a done word a worker thread waited and wrote back). That wedges on a cold prompt: the caller's
++//! stream also carries the prompt path's NCCL collectives, and with the two ranks gating each other through them
++//! the exchange's ready word is never written while both ranks' workers wait on their copy streams (reproduced:
++//! job 29 of the first prompt, both ranks parked in a stream wait, no socket ever idle, no timeout ever reached --
++//! the flags, not the wire). The DS backend's transport, qualified on this very wire, runs each exchange on the
++//! calling CPU and validates the connections with round trips before use; this revision follows it. gather() copies
++//! the shard down ordered after the caller's stream by an event, stripes it over the connections, copies both
++//! halves back ordered before the caller's next work by an event, and returns: the GPU pipeline drains while the
++//! CPU exchanges, NCCL collectives already queued keep both ranks moving, and an exchange that stalls is bounded
++//! by its poll-tick budget instead of parking a stream forever.
+ //!
+ //! Settings (both ranks must ask; the smaller cap wins, and the size alone decides, so both ranks take one path):
+ //!   TF_TCP_GATHER=1                   enable (default: off)
+@@ -18,9 +24,14 @@
+ //!   TF_TCP_GATHER_PEER_RAILS=a,b,c,d  the other rank's addresses, paired by position
+ //!   TF_TCP_GATHER_MIN_KB=2048         smallest shard it takes (below it NCCL keeps the gather)
+ //!   TF_TCP_GATHER_MAX_KB=32768        largest shard it takes (a rank's bytes)
+-//!   TF_TCP_GATHER_CONNS=8             connections, striped over the rails
++//!   TF_TCP_GATHER_CONNS=32            connections (8 a rail), striped i % rails
+ //!   TF_TCP_GATHER_PORT=30680          the first port (CONNS of them; channel k would take the next block)
+ //!   TF_TCP_GATHER_TIMEOUT_S=60        a connect, an exchange's wait for the peer, all in poll ticks (no clock needed)
++//!
++//! Which rails carry exchanges is the reference's qualified profile: with four rails discovered it is rails 0, 2
++//! and 3 (the DS backend's prefill.py ships `rails = [0, 2, 3]`; the fourth is connected and verified but idle),
++//! and with fewer than four every rail serves. The connection set still spans every rail -- rank 0 listens on all
++//! of them, as a topology change never needs a new port plan -- but the stripes tile the active ones only.
+ const std = @import("std");
+ const abi = @import("abi.zig");
+ const Driver = @import("driver.zig").Driver;
+@@ -29,15 +40,10 @@
+ const Stream = stream_mod.Stream;
+ const tp_group = @import("tp_group.zig");
+ 
+-pub const max_conns = 8;
++pub const max_conns = 32;
+ pub const max_rails = 4;
+-pub const slots = 8; // streams the path can serve (each gets a ready word; the engine uses two or three)
+-const depth = 8; // jobs in flight; the engine posts a prompt piece's gathers back to back
+ const header_bytes = 16; // sequence and length, big endian
+ 
+-const wait_geq: c_uint = 0; // CU_STREAM_WAIT_VALUE_GEQ
+-const write_default: c_uint = 0; // CU_STREAM_WRITE_VALUE_DEFAULT
+-
+ pub const Error = error{ Misaligned, BadConfig, Setup, ProxyFailed };
+ 
+ /// TF_TCP_GATHER=1 (or any value but 0) asks for this path; both ranks must ask.
+@@ -46,7 +52,7 @@
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+ }
+ 
+-/// TF_TCP_GATHER_DEBUG=1: every job enqueued and finished, every worker step (the log a hang is read from).
++/// TF_TCP_GATHER_DEBUG=1: every exchange served, and the log a hang is read from.
+ fn debugOn() bool {
+     const v = std.c.getenv("TF_TCP_GATHER_DEBUG") orelse return false;
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+@@ -97,7 +103,7 @@
+     _ = std.c.nanosleep(&ts, null);
+ }
+ 
+-/// Monotonic nanoseconds, for the staging/exchange split in the counters (never a deadline; the clock is not trusted).
++/// Monotonic nanoseconds, for the validate round trips' timing (never a deadline; the clock is not trusted).
+ fn monotonicNs() i128 {
+     var ts: std.c.timespec = undefined;
+     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+@@ -120,6 +126,22 @@
+     _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(flags)));
+ }
+ 
++/// The validate round trips' byte at `i`: rank- and salt-dependent, so a stripe that lands in the wrong buffer,
++/// a connection that pairs with another rail's, and a rank that echoes itself all fail the pattern.
++fn patternByte(rank: u32, salt: usize, i: usize) u8 {
++    const v: u32 = 0x5A ^ (rank *% 0x2D) ^ @as(u32, @truncate(salt)) ^ @as(u32, @truncate((i *% 109) >> 3));
++    return @truncate(v);
++}
++
++fn fillPattern(rank: u32, salt: usize, buf: []u8) void {
++    for (buf, 0..) |*b, i| b.* = patternByte(rank, salt, i);
++}
++
++fn patternOk(rank: u32, salt: usize, buf: []const u8) bool {
++    for (buf, 0..) |b, i| if (b != patternByte(rank, salt, i)) return false;
++    return true;
++}
++
+ /// One connection's part of one exchange: a stripe of the buffer, sent and received at once.
+ const Stripe = struct {
+     fd: std.c.fd_t,
+@@ -134,17 +156,6 @@
+     receiving: bool = true,
+ };
+ 
+-/// One job: a gather one stream posted. `id` pairs the exchange with the peer's k-th (both ranks issue the same
+-/// sequence); `slot` and `seq` address this rank's own ready word, never the peer's.
+-const Job = struct {
+-    mine: abi.DevicePtr,
+-    all: abi.DevicePtr,
+-    bytes: usize,
+-    id: u32,
+-    slot: u5,
+-    seq: u32,
+-};
+-
+ pub const Gather = struct {
+     d: *const Driver,
+     gpa: std.mem.Allocator,
+@@ -158,99 +169,94 @@
+     rails: [max_rails]u32 = @splat(0),
+     peer_rails: [max_rails]u32 = @splat(0),
+     n_rails: usize = 0,
+-    ctx: abi.Context = null, // the engine thread's context; the worker must set it before any driver call
+     host: memory.HostBuffer = undefined, // [0, cap): this rank's shard, [cap, 2 * cap): the peer's
+-    flags: memory.HostBuffer = undefined, // done at 0, then one ready word a slot
+-    host_dev: abi.DevicePtr = 0,
+-    flags_dev: abi.DevicePtr = 0,
+-    net: Stream = undefined, // the worker's copy stream; it stages and publishes there
++    net: Stream = undefined, // the exchange's copy stream: down, back, and the events that order both ends
++    go: stream_mod.Event = undefined, // records the caller's producer; the staging copy waits it
++    back: stream_mod.Event = undefined, // records the copies' end; the caller's next work waits it
+     fds: [max_conns]std.c.fd_t = @splat(-1),
+-    streams: [slots]abi.Stream = @splat(null), // a slot a stream, taken on first use (this rank's own affair)
+-    n_slots: usize = 0,
+-    jobs: [depth]Job = undefined,
+-    head: std.atomic.Value(usize) = .init(0), // the worker's
+-    tail: std.atomic.Value(usize) = .init(0), // the caller's
++    active: [max_conns]u8 = @splat(0), // the connections whose rail serves: stripes tile these only
++    n_active: usize = 0,
++    lock: std.atomic.Mutex = .unlocked, // one exchange at a time: the connections pair by issue order, both ranks in step
+     id: u32 = 0, // the exchange counter both ranks advance in step (the header's sequence)
+-    seqs: [slots]u32 = @splat(0),
+     running: std.atomic.Value(bool) = .init(true),
+     failed: std.atomic.Value(bool) = .init(false),
+     err: [192]u8 = @splat(0),
+-    thread: ?std.Thread = null,
+     calls: u64 = 0,
+     moved: u64 = 0,
+     debug: bool = false,
+ 
+-    /// A failed exchange. The engine's stream is waiting on this job's done word, so writing it (garbage rows) and
+-    /// aborting the communicator is the only way this ends loudly instead of hanging: the rank stops with the error.
++    /// A failed exchange. The caller's stream owes nothing (an exchange that fails never orders its copies into it),
++    /// so taking the communicator down is what ends this loudly: the rank stops with the error instead of serving
++    /// rows a gather did not fill.
+     fn fail(x: *Gather, comptime fmt: []const u8, args: anytype) void {
+         if (x.failed.swap(true, .acq_rel)) return;
+         _ = std.fmt.bufPrint(x.err[0 .. x.err.len - 1], fmt, args) catch {};
+         std.log.err("TCP all-gather failed: {s}", .{std.mem.sliceTo(&x.err, 0)});
+-        // Release a stream blocked on the job in flight, then take the communicator down: the rank stops with this
+-        // error (a gather that did not complete must not look like one that did).
+-        if (x.id != 0) _ = x.d.api.cuStreamWriteValue32_v2(x.net.handle, x.flags_dev, x.id, write_default);
+         x.group.abort();
+     }
+ 
+-    /// The worker: a job at a time, in order, each staged, exchanged and published without touching the caller.
+-    fn run(x: *Gather) void {
++    /// Both ranks' `bytes` from `mine` into `all` in rank order (as ncclAllGather), on `s`.
++    /// Synchronous on the calling thread, in the DS transport's shape: stage down, exchange, copy back, order the
++    /// caller's stream after the copies, return. The GPU keeps draining `s` (and every other stream) while the CPU
++    /// exchanges, so collectives already queued on either rank keep moving.
++    pub fn gather(x: *Gather, s: abi.Stream, mine: abi.DevicePtr, all: abi.DevicePtr, bytes: usize) Error!void {
++        if (mine % 16 != 0 or all % 16 != 0) return error.Misaligned;
++        if (x.failed.load(.acquire)) return error.ProxyFailed;
+         const d = x.d;
+-        if (d.api.cuCtxSetCurrent(x.ctx) != abi.success) { // a fresh thread has no context of its own
+-            x.fail("cuCtxSetCurrent (the worker thread)", .{});
+-            return;
+-        }
+-        if (x.debug) std.log.info("tcp-gather: worker up, {d} connection(s), cap {d} KiB", .{ x.conns, x.cap >> 10 });
+-        while (true) {
+-            const tail = x.tail.load(.acquire);
+-            if (x.head.load(.monotonic) == tail) {
+-                if (!x.running.load(.acquire)) {
+-                    if (x.debug) std.log.info("tcp-gather: worker stops (abort), {d} job(s) served", .{x.calls});
+-                    return;
+-                }
+-                sleepMs(50);
+-                continue;
+-            }
+-            const job = x.jobs[x.head.load(.monotonic) % depth];
+-            x.head.store(x.head.load(.monotonic) + 1, .release);
+-            if (x.debug) {
+-                const words: [*]const u32 = @ptrCast(@alignCast(x.flags.bytes.ptr));
+-                std.log.info("tcp-gather: job {d} start, {d} KiB, slot {d}, seq {d}, flags done={d} ready[0..{d}]={any}", .{ job.id, job.bytes >> 10, job.slot, job.seq, words[0], x.n_slots, x.seqs[0..x.n_slots] });
+-            }
+-
+-            const host = x.host.bytes[0..job.bytes];
+-            const peer = x.host.bytes[x.cap .. x.cap + job.bytes];
+-            d.check(d.api.cuStreamWaitValue32_v2(x.net.handle, x.flags_dev + 4 + @as(abi.DevicePtr, job.slot) * 4, job.seq, wait_geq), "cuStreamWaitValue32 (ready)") catch {
+-                x.fail("cuStreamWaitValue32 (ready)", .{});
+-                return;
++        const caller = Stream.borrowed(d, s);
++        {
++            while (!x.lock.tryLock()) std.Thread.yield() catch {};
++            defer x.lock.unlock();
++            if (!x.running.load(.acquire)) return error.ProxyFailed;
++            x.id +%= 1;
++            if (x.id == 0) x.id = 1; // 0 stays reserved: a header sequence of 0 is never sent
++            if (x.debug) std.log.info("tcp-gather: exchange {d} start, {d} KiB", .{ x.id, bytes >> 10 });
++
++            const host = x.host.bytes[0..bytes];
++            const peer = x.host.bytes[x.cap .. x.cap + bytes];
++            // The staging copy reads what the caller's stream has produced (its kernels, its collects).
++            x.go.record(caller) catch {
++                x.fail("cuEventRecord (go)", .{});
++                return error.ProxyFailed;
+             };
+-            d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(host.ptr), job.mine, job.bytes, x.net.handle), "cuMemcpyDtoHAsync") catch {
++            x.net.wait(x.go) catch {
++                x.fail("cuStreamWaitEvent (go)", .{});
++                return error.ProxyFailed;
++            };
++            d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(host.ptr), mine, bytes, x.net.handle), "cuMemcpyDtoHAsync") catch {
+                 x.fail("cuMemcpyDtoHAsync", .{});
+-                return;
++                return error.ProxyFailed;
+             };
+-            d.check(d.api.cuStreamSynchronize(x.net.handle), "cuStreamSynchronize (stage)") catch {
++            x.net.synchronize() catch {
+                 x.fail("cuStreamSynchronize (stage)", .{});
+-                return;
++                return error.ProxyFailed;
+             };
+-            x.exchange(job.id, host, peer) catch |e| {
++            x.exchange(x.id, host, peer) catch |e| {
+                 x.fail("exchange: {s}", .{@errorName(e)});
+-                return;
++                return error.ProxyFailed;
+             };
+-            d.check(d.api.cuMemcpyHtoDAsync_v2(job.all + x.rank * job.bytes, @ptrCast(host.ptr), job.bytes, x.net.handle), "cuMemcpyHtoDAsync (own)") catch {
++            d.check(d.api.cuMemcpyHtoDAsync_v2(all + x.rank * bytes, @ptrCast(host.ptr), bytes, x.net.handle), "cuMemcpyHtoDAsync (own)") catch {
+                 x.fail("cuMemcpyHtoDAsync (own)", .{});
+-                return;
++                return error.ProxyFailed;
+             };
+-            d.check(d.api.cuMemcpyHtoDAsync_v2(job.all + (1 - x.rank) * job.bytes, @ptrCast(peer.ptr), job.bytes, x.net.handle), "cuMemcpyHtoDAsync (peer)") catch {
++            d.check(d.api.cuMemcpyHtoDAsync_v2(all + (1 - x.rank) * bytes, @ptrCast(peer.ptr), bytes, x.net.handle), "cuMemcpyHtoDAsync (peer)") catch {
+                 x.fail("cuMemcpyHtoDAsync (peer)", .{});
+-                return;
++                return error.ProxyFailed;
++            };
++            // The caller's next queued work reads `all` only past these copies.
++            x.back.record(x.net) catch {
++                x.fail("cuEventRecord (back)", .{});
++                return error.ProxyFailed;
+             };
+-            d.check(d.api.cuStreamWriteValue32_v2(x.net.handle, x.flags_dev, job.id, write_default), "cuStreamWriteValue32 (done)") catch {
+-                x.fail("cuStreamWriteValue32 (done)", .{});
+-                return;
++            caller.wait(x.back) catch {
++                x.fail("cuStreamWaitEvent (back)", .{});
++                return error.ProxyFailed;
+             };
+             x.calls += 1;
+-            x.moved += job.bytes;
+-            if (x.debug) std.log.info("tcp-gather: job {d} done", .{job.id});
++            x.moved += bytes;
++            if (x.debug) std.log.info("tcp-gather: exchange {d} done", .{x.id});
+         }
++        if (x.failed.load(.acquire)) return error.ProxyFailed;
+     }
+ 
+     /// Every connection sends its stripe and takes the peer's; the stripes tile the buffer exactly. One thread polls
+@@ -258,10 +264,10 @@
+     /// peer is a count of poll ticks (the clock is not trusted for deadlines).
+     fn exchange(x: *Gather, id: u32, host: []const u8, peer: []u8) !void {
+         var stripes: [max_conns]Stripe = undefined;
+-        for (0..x.conns) |i| {
+-            const lo = host.len * i / x.conns;
+-            const hi = host.len * (i + 1) / x.conns;
+-            stripes[i] = .{ .fd = x.fds[i], .send_at = lo, .send_end = hi, .recv_at = lo, .recv_end = hi };
++        for (0..x.n_active) |i| {
++            const lo = host.len * i / x.n_active;
++            const hi = host.len * (i + 1) / x.n_active;
++            stripes[i] = .{ .fd = x.fds[x.active[i]], .send_at = lo, .send_end = hi, .recv_at = lo, .recv_end = hi };
+         }
+         var header: [header_bytes]u8 = undefined;
+         std.mem.writeInt(u64, header[0..8], id, .big);
+@@ -271,7 +277,7 @@
+             var fds: [max_conns]std.c.pollfd = undefined;
+             var which: [max_conns]usize = undefined;
+             var n: usize = 0;
+-            for (0..x.conns) |i| {
++            for (0..x.n_active) |i| {
+                 const s = stripes[i];
+                 if (!s.sending and !s.receiving) continue;
+                 fds[n] = .{
+@@ -289,8 +295,8 @@
+             if (rc == 0) { // idle: a second a tick. Progress resets the budget, so a busy exchange never times out.
+                 ticks += 1;
+                 if (x.debug and ticks % 5 == 0) {
+-                    std.log.warn("tcp-gather: job {d} idle {d}s, {d} stripe(s) active", .{ id, ticks, n });
+-                    for (stripes[0..x.conns], 0..) |st, k| {
++                    std.log.warn("tcp-gather: exchange {d} idle {d}s, {d} stripe(s) active", .{ id, ticks, n });
++                    for (stripes[0..x.n_active], 0..) |st, k| {
+                         if (!st.sending and !st.receiving) continue;
+                         std.log.warn("tcp-gather:   conn {d}: send {d}/{d} (+{d} hdr), recv hdr {d}, recv {d}/{d} [{d}-{d}]", .{ k, st.send_at - st.send_end + (st.send_end - st.send_at), st.send_end - st.send_at, st.sent_header, st.got_header, st.recv_at, st.recv_end - st.recv_at, st.recv_at, st.recv_end });
+                     }
+@@ -365,12 +371,11 @@
+             .rank = @intCast(group.rank),
+             .cap = max_bytes / 16 * 16,
+             .min_bytes = min_bytes / 16 * 16,
+-            .conns = std.math.clamp(envInt("TF_TCP_GATHER_CONNS", 8), 1, max_conns),
++            .conns = std.math.clamp(envInt("TF_TCP_GATHER_CONNS", 32), 1, max_conns),
+             .port = @intCast(std.math.clamp(envInt("TF_TCP_GATHER_PORT", 30680), 1024, 65535 - max_conns)),
+             .timeout_s = std.math.clamp(envInt("TF_TCP_GATHER_TIMEOUT_S", 60), 1, 3600),
+             .debug = debugOn(),
+         };
+-        if (d.api.cuCtxGetCurrent(&x.ctx) != abi.success) return error.Setup; // the worker sets it current
+         x.n_rails = parseRails("TF_TCP_GATHER_RAILS", &x.rails) catch return error.BadConfig;
+         const peer_n = parseRails("TF_TCP_GATHER_PEER_RAILS", &x.peer_rails) catch return error.BadConfig;
+         if (peer_n != x.n_rails) return error.BadConfig;
+@@ -389,22 +394,21 @@
+         x.cap = @min(x.cap, @as(usize, @intCast(theirs >> 32)) << 10);
+         if (x.cap < x.min_bytes) return null;
+ 
+-        // The buffers, the copy stream, the sockets: one set for every stream.
++        // The staging buffer, the copy stream and its two events, the sockets: one set for every caller.
+         x.host = memory.HostBuffer.allocMapped(d, 2 * x.cap) catch return error.Setup;
+         @memset(x.host.bytes, 0);
+-        x.flags = memory.HostBuffer.allocMapped(d, 4096) catch {
++        x.net = Stream.init(d, true) catch {
+             x.host.free();
+             return error.Setup;
+         };
+-        @memset(x.flags.bytes, 0);
+-        x.flags_dev = x.flags.device() catch {
+-            x.flags.free();
++        x.go = stream_mod.Event.init(d, false) catch {
++            x.net.deinit();
+             x.host.free();
+             return error.Setup;
+         };
+-        x.host_dev = 0;
+-        x.net = Stream.init(d, true) catch {
+-            x.flags.free();
++        x.back = stream_mod.Event.init(d, false) catch {
++            x.go.deinit();
++            x.net.deinit();
+             x.host.free();
+             return error.Setup;
+         };
+@@ -419,72 +423,80 @@
+         group.gather(u32, d, s, ok, &both_ok) catch {
+             x.fail("the connected handshake did not cross", .{});
+             x.teardownSockets();
++            x.back.deinit();
++            x.go.deinit();
+             x.net.deinit();
+-            x.flags.free();
+             x.host.free();
+             return error.Setup;
+         };
+         if (both_ok[0] != 1 or both_ok[1] != 1) {
+             std.log.warn("TCP all-gather: the rails' sockets did not open on both ranks; NCCL carries every gather", .{});
+             x.teardownSockets();
++            x.back.deinit();
++            x.go.deinit();
+             x.net.deinit();
+-            x.flags.free();
+             x.host.free();
+             return null; // agreed: the path is simply not there (fits stays false; nothing failed)
+         }
+-        x.thread = std.Thread.spawn(.{}, run, .{x}) catch {
++        // The reference's qualified rail set: with four rails it is 0, 2 and 3 (its prefill.py's `rails = [0, 2, 3]`);
++        // a smaller topology serves every rail. The stripes tile the active connections; the rest stay connected
++        // and idle, so both ranks agree on the same active set by construction (it derives from the rail count).
++        for (0..x.conns) |i| {
++            const rail = i % x.n_rails;
++            if (x.n_rails == 4 and rail == 1) continue;
++            x.active[x.n_active] = @intCast(i);
++            x.n_active += 1;
++        }
++        // The wire is proven before the first gather: round trips at several sizes, both ranks the same code and
++        // the same sizes (they derive from the agreed cap), so the exchanges pair as every later one will.
++        x.validate() catch |e| {
++            std.log.warn("TCP all-gather: the rails' round trips failed ({s}); NCCL carries every gather", .{@errorName(e)});
+             x.teardownSockets();
++            x.back.deinit();
++            x.go.deinit();
+             x.net.deinit();
+-            x.flags.free();
+             x.host.free();
+-            return error.Setup;
++            return null;
+         };
+         keep = true;
+-        std.log.info("TCP all-gather: {d} rail(s), {d} connection(s), shards {d}-{d} KiB over the rails", .{ x.n_rails, x.conns, x.min_bytes >> 10, x.cap >> 10 });
+-        if (x.debug) std.log.info("tcp-gather: flags at 0x{x} (done) and 0x{x}.. (ready), host 0x{x}, net stream 0x{x}", .{ x.flags_dev, x.flags_dev + 4, @intFromPtr(x.host.bytes.ptr), @intFromPtr(x.net.handle) });
++        var serving: usize = x.n_rails;
++        if (x.n_rails == 4) serving = 3;
++        std.log.info("TCP all-gather: {d} rail(s) found, {d} serving (the reference's qualified set), {d} of {d} connection(s), shards {d}-{d} KiB", .{ x.n_rails, serving, x.n_active, x.conns, x.min_bytes >> 10, x.cap >> 10 });
+         return x;
+     }
+ 
++    /// Round trips before the first gather, as the DS transport validates its connections: patterned shards at
++    /// several sizes down to 64 KiB, each verified byte for byte. Both ranks run the same sizes in the same order,
++    /// so the header sequence pairs them exactly as a gather's exchanges pair.
++    fn validate(x: *Gather) !void {
++        var size = x.cap;
++        var salt: usize = 0;
++        while (true) : (salt += 1) {
++            x.id +%= 1;
++            if (x.id == 0) x.id = 1;
++            const mine = x.host.bytes[0..size];
++            const theirs = x.host.bytes[x.cap .. x.cap + size];
++            fillPattern(x.rank, salt, mine);
++            @memset(theirs, 0);
++            const t0 = monotonicNs();
++            try x.exchange(x.id, mine, theirs);
++            if (!patternOk(1 - x.rank, salt, theirs)) {
++                std.log.err("TCP all-gather: the round trip of {d} KiB came back wrong", .{size >> 10});
++                return error.Setup;
++            }
++            if (x.debug) std.log.info("tcp-gather: round trip {d} KiB in {d} ms", .{ size >> 10, @divTrunc(monotonicNs() - t0, std.time.ns_per_ms) });
++            if (size <= 64 << 10 or salt + 1 >= 7) break;
++            size /= 4;
++        }
++    }
++
+     /// Whether a gather of `bytes` goes this way: the size alone decides, so both ranks take one path.
+     pub fn fits(x: *const Gather, bytes: usize) bool {
+         if (x.failed.load(.acquire)) return false;
+         return bytes >= x.min_bytes and bytes <= x.cap and bytes % 16 == 0;
+     }
+ 
+-    /// This stream's slot, taken on first use; the peer never sees it (the exchange pairs by issue order alone).
+-    fn slotFor(x: *Gather, s: abi.Stream) Error!u5 {
+-        for (x.streams, 0..) |known, i| if (known == s) return @intCast(i);
+-        if (x.n_slots == slots) return error.Setup;
+-        const taken = x.n_slots;
+-        x.streams[taken] = s;
+-        x.n_slots += 1;
+-        return @intCast(taken);
+-    }
+-
+-    /// Both ranks' `bytes` from `mine` into `all` in rank order (as ncclAllGather), on `s`.
+-    pub fn gather(x: *Gather, s: abi.Stream, mine: abi.DevicePtr, all: abi.DevicePtr, bytes: usize) Error!void {
+-        if (mine % 16 != 0 or all % 16 != 0) return error.Misaligned;
+-        if (x.failed.load(.acquire)) return error.ProxyFailed;
+-        const slot = try x.slotFor(s);
+-        while (x.tail.load(.acquire) - x.head.load(.acquire) == depth) {
+-            if (x.failed.load(.acquire)) return error.ProxyFailed;
+-            sleepMs(20);
+-        }
+-        x.id +%= 1;
+-        if (x.id == 0) x.id = 1; // 0 is every flag word's initial value
+-        x.seqs[slot] +%= 1;
+-        if (x.seqs[slot] == 0) x.seqs[slot] = 1;
+-        x.jobs[x.tail.load(.monotonic) % depth] = .{ .mine = mine, .all = all, .bytes = bytes, .id = x.id, .slot = slot, .seq = x.seqs[slot] };
+-        if (x.debug) std.log.info("tcp-gather: enqueue {d} ({d} KiB, slot {d})", .{ x.id, bytes >> 10, slot });
+-        x.tail.store(x.tail.load(.monotonic) + 1, .release);
+-        // The producer before the copy (this rank's ready word), the caller's stream after the gather (the done word);
+-        // every value only grows, so the stream's wait is satisfied only by this job's own completion.
+-        x.d.check(x.d.api.cuStreamWriteValue32_v2(s, x.flags_dev + 4 + @as(abi.DevicePtr, slot) * 4, x.seqs[slot], write_default), "cuStreamWriteValue32") catch return error.Setup;
+-        x.d.check(x.d.api.cuStreamWaitValue32_v2(s, x.flags_dev, x.id, wait_geq), "cuStreamWaitValue32") catch return error.Setup;
+-        if (x.debug) std.log.info("tcp-gather: queued {d}", .{x.id});
+-    }
+-
+-    /// An error if the worker gave up (its rows hold nothing valid): call it after a synchronize that reads a gather.
++    /// An error if an exchange gave up (its rows hold nothing valid): call it after a synchronize that reads a gather.
+     pub fn check(x: *Gather) !void {
+         if (!x.failed.load(.acquire)) return;
+         return error.ProxyFailed;
+@@ -573,9 +585,9 @@
+ 
+     pub fn deinit(x: *Gather) void {
+         x.abort();
+-        if (x.thread) |t| t.join();
++        x.back.deinit();
++        x.go.deinit();
+         x.net.deinit();
+-        x.flags.free();
+         x.host.free();
+         x.gpa.destroy(x);
+     }
+@@ -607,18 +619,14 @@
+     try std.testing.expect(!Gather.fits(&x, 4 << 20));
+ }
+ 
+-test "TCP all-gather: a stream takes a slot once, and the table refuses past its end" {
+-    var x: Gather = undefined;
+-    x.streams = @splat(null);
+-    x.n_slots = 0;
+-    const a = try Gather.slotFor(&x, @ptrFromInt(0x1000));
+-    const b = try Gather.slotFor(&x, @ptrFromInt(0x2000));
+-    const a2 = try Gather.slotFor(&x, @ptrFromInt(0x1000));
+-    try std.testing.expectEqual(@as(u5, 0), a);
+-    try std.testing.expectEqual(@as(u5, 1), b);
+-    try std.testing.expectEqual(a, a2);
+-    while (x.n_slots < slots) {
+-        _ = Gather.slotFor(&x, @ptrFromInt(0x3000 + x.n_slots)) catch return error.TestUnexpectedResult;
+-    }
+-    try std.testing.expectError(error.Setup, Gather.slotFor(&x, @ptrFromInt(0x9000)));
++test "TCP all-gather: the round trip's pattern catches a wrong byte, rail or rank" {
++    var buf: [256]u8 = undefined;
++    fillPattern(0, 3, buf[0..]);
++    try std.testing.expect(patternOk(0, 3, buf[0..]));
++    // Another rank's pattern (what the peer must echo back its own fill of) is not ours.
++    try std.testing.expect(!patternOk(1, 3, buf[0..]));
++    buf[100] ^= 1;
++    try std.testing.expect(!patternOk(0, 3, buf[0..]));
++    fillPattern(1, 4, buf[0..]);
++    try std.testing.expect(patternOk(1, 4, buf[0..]));
+ }

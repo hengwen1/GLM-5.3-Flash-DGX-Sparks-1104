@@ -1,5 +1,16 @@
 # Changelog
 
+- **2026-11-06** -- **Thor: the rails' all-gathers run on the calling thread** (`TCP_GATHER`, patch 0109, **on**). The staged
+  cut (0108) wedged a cold prompt: the caller's stream owed the worker a ready word while it carried the prompt path's NCCL
+  collectives, and the two ranks gated each other into a stop (reproduced at job 29 of the first prompt: both ranks parked in
+  a copy-stream wait, no socket ever idle, `TF_TCP_GATHER_TIMEOUT_S` never reached -- the flags, not the wire). The revision
+  follows the Thor EXL3 backend's prefill transport (MGBE-RAILS) rail for rail: the exchange runs between the pipeline's steps
+  on the calling CPU, ordered onto the caller's stream by events at both ends; 32 connections stripe `i % rails`, 8 a rail,
+  each bound to its rail, and with four rails the qualified set 0, 2 and 3 serves (its `rails = [0, 2, 3]`; the fourth is
+  connected but idle); patterned round trips prove the wire before the first gather. `TCP_GATHER` defaults on; a failed round
+  trip, a stalled exchange (now a loud 60 s stop, never a hang) or a silent peer turns the path off on both ranks and NCCL
+  carries every gather. The qualified profile's 16 MiB socket buffers (`net.core.rmem_max`/`wmem_max`) are applied on both
+  nodes, which `start.sh` keeps checking.
 - **2026-11-06** -- **Thor: the rails' own all-gathers for prompt pieces** (`TCP_GATHER`, patch 0108, **off**). NCCL's socket transport uses one
   MGBE rail's bandwidth however many it lists; the engine now stripes a prompt piece's all-gathers over all four by
   its own sockets (measured 64 MiB a rank at 12.5 ms against NCCL's 48.2; `bench/tp_gather/` is the benchmark).

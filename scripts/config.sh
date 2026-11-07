@@ -70,6 +70,10 @@ NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-}"       # the RoCE v2 IPv4 GID index (a
 # ports above FABRIC_MIN_SPEED_MBPS. NCCL pairs a rank's interface with the peer's on the same subnet, so each rail
 # carries its own channels.
 FABRIC_MIN_SPEED_MBPS="${FABRIC_MIN_SPEED_MBPS:-10000}"   # a link rail's speed floor; keeps a 1G/5G LAN out of the fabric
+# The qualified four-rail profile raises the kernel's socket buffer ceiling to 16 MiB on both nodes before the rails
+# carry TCP (NCCL's socket transport and the engine's own all-gathers are bounded by it). Read-only here: start.sh
+# warns with the command when either side is below this.
+RAIL_TCP_BUFFER_BYTES="${RAIL_TCP_BUFFER_BYTES:-16777216}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-4}"              # NCCL_MIN_NCHANNELS and NCCL_MAX_NCHANNELS
 PORT="${PORT:-8020}"
 HOST="${HOST:-0.0.0.0}"
@@ -85,16 +89,20 @@ SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash}"
 ROCE="${ROCE:-auto}"                            # auto: on when both nodes expose an RDMA device, else off
 ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest shard the RDMA region holds
 
-# TCP_GATHER=on: EXPERIMENTAL (not qualified). On a TCP fabric the engine carries a prompt piece's all-gathers over the rails' own
+# TCP_GATHER=on: on a TCP fabric the engine carries a prompt piece's all-gathers over the rails' own
 # sockets (zig/src/cuda/tcp_gather.zig) instead of NCCL's, which uses one rail's worth of bandwidth (measured on this
-# pair: 16 MiB the same with one interface as with four). It stripes CONNS connections over the rails the launcher
-# found; the size alone decides, so both ranks take one path. Off by default: the path is benchmarked (bench/tp_gather)
-# but not yet qualified end to end, and a prompt still fails on this pair (docs/thor.md).
+# pair: 16 MiB the same with one interface as with four). The exchange runs on the calling thread in the Thor EXL3
+# backend's prefill-transport shape (MGBE-RAILS): 32 connections striped i % rails (8 a rail), each bound to its rail,
+# and with four rails the reference's qualified set 0, 2 and 3 serves (its prefill.py's rails = [0, 2, 3]; a smaller
+# topology serves every rail). Patterned round trips prove the wire before the first gather, and the size alone
+# decides, so both ranks take one path. The first cut (0108) staged gathers through device flag words and wedged a
+# cold prompt (both ranks' streams waiting on words their own collectives owed); 0109 is synchronous, stripes only the
+# serving connections and fails loudly (a 60 s budget, never a hang).
 # off (TF_TCP_GATHER=0 on either rank): NCCL carries every gather.
-TCP_GATHER="${TCP_GATHER:-off}"                 # off (default) until it is qualified on the pair; on: the rails' path
+TCP_GATHER="${TCP_GATHER:-on}"                  # on (patch 0109, synchronous); off: every gather back on NCCL
 TCP_GATHER_MIN_KB="${TCP_GATHER_MIN_KB:-2048}"  # TF_TCP_GATHER_MIN_KB: smaller gathers stay on NCCL
 TCP_GATHER_MAX_KB="${TCP_GATHER_MAX_KB:-32768}" # TF_TCP_GATHER_MAX_KB: a rank's largest shard
-TCP_GATHER_CONNS="${TCP_GATHER_CONNS:-8}"       # TF_TCP_GATHER_CONNS: connections, striped over the rails
+TCP_GATHER_CONNS="${TCP_GATHER_CONNS:-32}"      # TF_TCP_GATHER_CONNS: 8 a rail, striped i % rails; 24 of them serve (rails 0,2,3)
 TCP_GATHER_PORT="${TCP_GATHER_PORT:-30680}"     # TF_TCP_GATHER_PORT: the first port (CONNS a stream)
 # The rails' path carries all-gather prompt exchanges, so a TCP fabric serves prompts in PREFILL_REDUCE=gather
 # (split's point-to-point sends stay on NCCL's single socket); the launcher sets it when TCP_GATHER is on.
