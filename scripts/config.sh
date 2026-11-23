@@ -33,10 +33,16 @@ TF_REF="${TF_REF:-81de26f649677aa72ae0034d4af6e010cd947038}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 # sha256 of zig-aarch64-linux-0.17.0.tar.xz (ziglang.org/download/index.json).
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
-SM="${SM:-121}"                                  # DGX Spark GB10: sm_121 (the engine's own default -Dsm target)
-ZIG_CPU="${ZIG_CPU:-native}"                     # the image is built on a Spark and runs on Sparks; baseline to move it
+SM="${SM:-}"                                     # empty/auto: GPU compute cap (GB10 -> 121, Jetson AGX Thor -> 110a)
+ZIG_CPU="${ZIG_CPU:-native}"                     # the image is built on a node and runs on it; baseline to move it
 NCCL_WHEEL="${NCCL_WHEEL:-}"                     # non-empty: install this nvidia-nccl-cu13 version over the base image's
 IMAGE="${IMAGE:-}"                               # empty: tensorfold-glm53-spark:<PATCHES_HASH>
+# How Docker hands a container the GPU. gpus: `--gpus all` (DGX OS on Spark). runtime: `--runtime=nvidia` (JetPack on
+# Thor, which refuses `--gpus`). auto asks each node's daemon.
+GPU_RUNTIME="${GPU_RUNTIME:-auto}"
+# Minimum link speed (Mb/s) for auto-discovered Ethernet rails when no RDMA device is present (keeps 1G LAN out).
+FABRIC_MIN_SPEED_MBPS="${FABRIC_MIN_SPEED_MBPS:-10000}"
+RAIL_TCP_BUFFER_BYTES="${RAIL_TCP_BUFFER_BYTES:-16777216}"
 # WITH_VIDEO=1 builds libtfvideo.so (FFmpeg 9.0.2, static) into the image, so VISION=1 serves video_url parts too
 # (issue 8). It adds a few minutes to a build and has its own image tag. 0 (default): video_url parts return HTTP 500.
 WITH_VIDEO="${WITH_VIDEO:-0}"
@@ -73,8 +79,18 @@ SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash}"
 # measured upstream on two GB10s over one ConnectX-7 cable). Larger collectives stay on NCCL, and the size alone
 # decides, so both ranks always take the same path. Same bytes in the same places as NCCL: the same bits.
 # off (TF_ROCE=0 on either rank): NCCL carries everything.
-ROCE="${ROCE:-on}"
+ROCE="${ROCE:-auto}"                             # auto (on on RDMA fabric, off on Ethernet Thor) | on | off
 ROCE_MAX_KB="${ROCE_MAX_KB:-4096}"               # TF_ROCE_MAX_KB, the largest shard the RDMA region holds
+# /dev/mgbe_zc 4x25GbE zero-copy TP=2 transport on Jetson AGX Thor (zig/src/cuda/mgbe_zc.zig, patch 0018).
+# auto: enabled when LINK_KIND=tcp and /dev/mgbe_zc exists on both nodes; on: require it; off: NCCL TCP only.
+MGBE_ZC="${MGBE_ZC:-auto}"
+MGBE_ZC_GROUP="${MGBE_ZC_GROUP:-mgbe_zc}"        # host group owning /dev/mgbe_zc via udev rule (passed as --group-add)
+MGBE_ZC_MAX_KB="${MGBE_ZC_MAX_KB:-16384}"        # TF_MGBE_ZC_MAX_KB: max shard per rank (covers decode + pieced prefill)
+MGBE_ZC_EAGER_KB="${MGBE_ZC_EAGER_KB:-32}"       # TF_MGBE_ZC_EAGER_KB: per-rail eager (VDMA2) vs DDP (VDMA3) threshold
+MGBE_ZC_PORTS="${MGBE_ZC_PORTS:-}"               # TF_MGBE_ZC_PORTS: comma list of MGBE port indices (auto from live rails)
+MGBE_ZC_CPUS="${MGBE_ZC_CPUS:-}"                 # TF_MGBE_ZC_CPUS: optional CPU affinity per rail worker (e.g. 2,3,4,5)
+TP2_PREFILL_REDUCE="${TP2_PREFILL_REDUCE:-auto}" # auto (gather when MGBE_ZC=on so prefill uses 4-rail DDP, else split) | gather | split
+GLM_MM_CUBLAS="${GLM_MM_CUBLAS:-0}"              # TF_GLM_MM_CUBLAS: opt-in cuBLASLt for dense prompt linears >= 128 rows
 
 # --- four Sparks (./start-tp4.sh, ./start-tp4-switchless.sh, ./stop-tp4.sh; README "4 Sparks") ----------------------
 # TP=4 over four Sparks: this Spark (rank 0, the API) and WORKER, WORKER2, WORKER3 (ranks 1-3). On a switch

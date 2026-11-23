@@ -1,0 +1,420 @@
+From f063bc2f73f850ca0f97c0a2b48910f33692aa14 Mon Sep 17 00:00:00 2001
+From: test <test@thor.local>
+Date: Sun, 22 Nov 2026 22:09:18 -0500
+Subject: [PATCH] exl3: sm_110a tcgen05 5th-gen tensor core EXL3 prompt kernel
+
+---
+ zig/kernels/cuda/exl3_experts.cu    |  32 +++-
+ zig/kernels/cuda/exl3_prompt.cuh    | 244 +++++++++++++++++++++++++++-
+ zig/tests/cuda/glm_exl3_compact.zig |  29 +++-
+ 3 files changed, 296 insertions(+), 9 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index c0253a749..2419f980f 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -303,7 +303,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const hal
+     const int e = items[3 * item];
+     if (e == skip) return;
+ 
+-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];   // one buffer for either instantiation
++    __shared__ __align__(128) unsigned char smem_raw[tsmem_bytes<8>()];   // one buffer for either instantiation
+     __shared__ int rows_sh[TPM];
+     prompt_gu<8>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
+ }
+@@ -319,7 +319,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_k6(const
+     const int e = items[3 * item];
+     if (e == skip) return;
+ 
+-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<6>()];
++    __shared__ __align__(128) unsigned char smem_raw[tsmem_bytes<6>()];
+     __shared__ int rows_sh[TPM];
+     prompt_gu<6>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
+ }
+@@ -338,12 +338,27 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_k6(const
+ template <int K2>
+ __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const half* __restrict__ svh_d,
+         float* __restrict__ y, int K, int D, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp, int lane) {
++    float* Ed = reinterpret_cast<float*>(smem_raw);
++#if TF_EXL3_PROMPT_TCGEN05
++    __shared__ uint32_t tmem_addr;
++    if (warp == 0) {
++        const uint32_t sh = (uint32_t)__cvta_generic_to_shared(&tmem_addr);
++        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 128;" :: "r"(sh));
++    }
++    __syncthreads();
++    const uint32_t taddr = tmem_addr;
++    tmain_tcgen05<1, TPM, K2>(Xd, Xd, Td, Td, rows_sh, e, K, D >> 4, cb, 1, smem_raw, taddr);
++#else
+     float acc[TMT][TNB][4];
+     tmain<1, TPM, K2>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+-    float* Ed = reinterpret_cast<float*>(smem_raw);
++#endif
+     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
+         if (hf) __syncthreads();
++#if TF_EXL3_PROMPT_TCGEN05
++        tspill_tcgen05<1>(Ed, DN_ES, taddr, hf);
++#else
+         tspill(Ed, DN_ES, warp * TMT * 16, acc, hf);
++#endif
+         __syncthreads();
+         for (int i = warp; i < TPH && hf * TPH + i < cnt; i += TNW) {
+             const int p = rows_sh[hf * TPH + i];
+@@ -360,13 +375,20 @@ __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const u
+             }
+         }
+     }
++#if TF_EXL3_PROMPT_TCGEN05
++    __syncthreads();
++    if (warp == 0) {
++        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 128;" :: "r"(taddr));
++        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
++    }
++#endif
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+         float* __restrict__ y, int K, int D, int skip) {
+ 
+-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
++    __shared__ __align__(128) unsigned char smem_raw[tsmem_bytes<8>()];
+     __shared__ int rows_sh[TPM];
+     TF_EXL3_PROMPT_DOWN_HEAD()
+     prompt_down<8>(Xd, Td, svh_d, y, K, D, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+@@ -377,7 +399,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_k6(cons
+         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+         float* __restrict__ y, int K, int D, int skip) {
+ 
+-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<6>()];
++    __shared__ __align__(128) unsigned char smem_raw[tsmem_bytes<6>()];
+     __shared__ int rows_sh[TPM];
+     TF_EXL3_PROMPT_DOWN_HEAD()
+     prompt_down<6>(Xd, Td, svh_d, y, K, D, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+diff --git a/zig/kernels/cuda/exl3_prompt.cuh b/zig/kernels/cuda/exl3_prompt.cuh
+index cbbf60d12..5bca86605 100644
+--- a/zig/kernels/cuda/exl3_prompt.cuh
++++ b/zig/kernels/cuda/exl3_prompt.cuh
+@@ -43,6 +43,224 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
+     nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
+ }
+ 
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1100 && defined(__CUDA_ARCH_FEAT_SM110_ALL)
++#define TF_EXL3_PROMPT_TCGEN05 1
++
++__device__ __forceinline__ uint64_t tcgen05_smem_desc(uint32_t smem_addr, uint32_t lbo_bytes, uint32_t sbo_bytes) {
++    uint64_t d = 0;
++    d |= (uint64_t)((smem_addr & 0x3FFFFu) >> 4);
++    d |= (uint64_t)((lbo_bytes & 0x3FFFFu) >> 4) << 16;
++    d |= (uint64_t)((sbo_bytes & 0x3FFFFu) >> 4) << 32;
++    d |= (uint64_t)1ULL << 46;   // PTX 8.7+ tcgen05 descriptor version bit
++    return d;
++}
++
++// tcgen05.mma.cta_group::1.kind::f16: D=fp32 (1<<4), A=fp16, B=fp16, K-major, N=64 (8<<17), M=128 (8<<24).
++__device__ __forceinline__ constexpr uint32_t tcgen05_idesc_f16_m128_n64() {
++    return (1u << 4) | (8u << 17) | (8u << 24);
++}
++
++__device__ __forceinline__ void tcgen05_mbar_init(uint64_t* mbar, uint32_t count) {
++    const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(addr), "r"(count) : "memory");
++}
++
++__device__ __forceinline__ void tcgen05_mbar_wait(uint64_t* mbar, uint32_t parity) {
++    const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++    asm volatile(
++        "{\n\t"
++        ".reg .pred done;\n\t"
++        "TF_MBAR_WAIT_%=:\n\t"
++        "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1, 10000000;\n\t"
++        "@!done bra TF_MBAR_WAIT_%=;\n\t"
++        "}\n"
++        :: "r"(addr), "r"(parity) : "memory");
++}
++
++__device__ __forceinline__ void tcgen05_mma_k32(uint32_t taddr, uint32_t a_base, uint32_t b_base, bool accum) {
++    constexpr uint32_t idesc = tcgen05_idesc_f16_m128_n64();
++    const uint64_t da0 = tcgen05_smem_desc(a_base, 128, 512);
++    const uint64_t db0 = tcgen05_smem_desc(b_base, 128, 512);
++    const uint64_t da1 = tcgen05_smem_desc(a_base + 256, 128, 512);
++    const uint64_t db1 = tcgen05_smem_desc(b_base + 256, 128, 512);
++    const uint32_t acc_flag = accum ? 1u : 0u;
++    asm volatile(
++        "{\n\t"
++        ".reg .pred p0, p1;\n\t"
++        "setp.ne.b32 p0, %6, 0;\n\t"
++        "setp.ne.b32 p1, 1, 0;\n\t"
++        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p0;\n\t"
++        "tcgen05.mma.cta_group::1.kind::f16 [%0], %4, %5, %3, p1;\n\t"
++        "}\n"
++        :: "r"(taddr), "l"(da0), "l"(db0), "r"(idesc), "l"(da1), "l"(db1), "r"(acc_flag) : "memory");
++}
++
++__device__ __forceinline__ void tcgen05_commit(uint64_t* mbar) {
++    const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];" :: "r"(addr) : "memory");
++}
++
++__device__ __forceinline__ void tcgen05_ld16(uint32_t addr, uint32_t (&r)[16]) {
++    asm volatile(
++        "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
++        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];\n\t"
++        "tcgen05.wait::ld.sync.aligned;"
++        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]),
++          "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7]),
++          "=r"(r[8]), "=r"(r[9]), "=r"(r[10]), "=r"(r[11]),
++          "=r"(r[12]), "=r"(r[13]), "=r"(r[14]), "=r"(r[15])
++        : "r"(addr)
++        : "memory");
++}
++
++// sm_110a (Jetson AGX Thor) 5th-gen tensor core main loop:
++// Computes two 128x64 fp32 tiles into TMEM columns [taddr, taddr+64) and [taddr+64, taddr+128), overlapping
++// cp.async of chunk c+1 and EXL3 dequant of half 1/0 with tcgen05.mma on the opposite 8 KiB A buffer.
++template <int MATS, int XR, int K2>
++__device__ __forceinline__ void tmain_tcgen05(const half* __restrict__ X0, const half* __restrict__ X1,
++        const uint64_t* __restrict__ tp0, const uint64_t* __restrict__ tp1, const int* rows_sh, int e, int K,
++        int NTILES, int cb, int xdiv, unsigned char* smem_raw, uint32_t taddr) {
++    constexpr int A_BYTES = 128 * TBK * 2;                    // 8192 B per 128x32 half tile
++    constexpr int B_BYTES = XR * TBK * 2;                     // 4096 B (XR=64) or 8192 B (XR=128)
++    constexpr int W_WORDS = twords<K2>();                     // 1024 (K2=8) or 768 (K2=6) u32 words
++    constexpr int W_BYTES = W_WORDS * 4;
++    static_assert(2 * A_BYTES + 2 * B_BYTES + 2 * W_BYTES <= tsmem_bytes<K2>(), "tcgen05 smem fits tsmem_bytes");
++
++    constexpr int TW = tile_words<K2>(), PIECES = TW / 4;
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int chunks = K / TBK;
++    const uint32_t* T0 = reinterpret_cast<const uint32_t*>(tp0[e]);
++    const uint32_t* T1 = reinterpret_cast<const uint32_t*>(tp1[e]);
++
++    uint32_t* A0_u32 = reinterpret_cast<uint32_t*>(smem_raw);
++    uint32_t* A1_u32 = reinterpret_cast<uint32_t*>(smem_raw + A_BYTES);
++    half* B_base = reinterpret_cast<half*>(smem_raw + 2 * A_BYTES);
++    uint32_t* W_base = reinterpret_cast<uint32_t*>(smem_raw + 2 * A_BYTES + 2 * B_BYTES);
++
++    const uint32_t a0_smem = (uint32_t)__cvta_generic_to_shared(A0_u32);
++    const uint32_t a1_smem = (uint32_t)__cvta_generic_to_shared(A1_u32);
++    const uint32_t b0_smem = (uint32_t)__cvta_generic_to_shared(B_base);
++    const uint32_t b1_smem = b0_smem + (uint32_t)B_BYTES;
++
++    __shared__ __align__(8) uint64_t mbar[2];
++    if (tid == 0) {
++        tcgen05_mbar_init(&mbar[0], 1);
++        tcgen05_mbar_init(&mbar[1], 1);
++    }
++
++    auto load_bw = [&](int chunk) {
++        const int cbuf = chunk & 1;
++        half* bdst = B_base + (size_t)cbuf * (XR * TBK);
++        const int k0 = chunk * TBK;
++        // Stage X straight into canonical 8x8 core matrices (16 B = 8 half per core row, zero-filled if r < 0).
++        for (int idx = tid; idx < XR * (TBK / 8); idx += TT) {
++            const int m = idx / (TPM * (TBK / 8)), rem = idx % (TPM * (TBK / 8));
++            const int i = rem >> 2, kb = rem & 3;
++            const int r = rows_sh[i];
++            const int rb = i >> 3, rl = i & 7;
++            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + k0 + kb * 8;
++            cp_async16(bdst + (size_t)m * (TPM * TBK) + ((rb * 4 + kb) * 8 + rl) * 8, src, r >= 0);
++        }
++        uint32_t* wdst = W_base + (size_t)cbuf * W_WORDS;
++        for (int idx = tid; idx < 16 * TKT * PIECES; idx += TT) {
++            const int q = idx / (TKT * PIECES), kk = (idx / PIECES) % TKT, part = idx % PIECES;
++            int wm, nt;
++            ttile<MATS>(q, cb, wm, nt);
++            const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * TW + part * 4;
++            cp_async16(wdst + ((size_t)q * TKT + kk) * TW + part * 4, src, true);
++        }
++    };
++
++    auto decode_half = [&](const uint32_t* ws, uint32_t* A_u32, int half_id) {
++        const int q = half_id * 8 + warp;
++        const int rb0 = warp * 2, rb1 = warp * 2 + 1;
++#pragma unroll
++        for (int kk = 0; kk < TKT; ++kk) {
++            uint32_t b0[2], b1[2];
++            decode_tile_p<K2>(ws + ((size_t)q * TKT + kk) * TW, lane, b0, b1);
++            const int kb0 = kk * 2, kb1 = kk * 2 + 1;
++            // lane == (rl * 4 + kp), so all 32 lanes hit 32 distinct SMEM banks with zero conflicts.
++            A_u32[(rb0 * 4 + kb0) * 32 + lane] = b0[0];
++            A_u32[(rb0 * 4 + kb1) * 32 + lane] = b0[1];
++            A_u32[(rb1 * 4 + kb0) * 32 + lane] = b1[0];
++            A_u32[(rb1 * 4 + kb1) * 32 + lane] = b1[1];
++        }
++    };
++
++    if (chunks > 0) load_bw(0);
++    cp_commit();
++    __syncthreads();
++
++    uint32_t phase0 = 0, phase1 = 0;
++    for (int c = 0; c < chunks; ++c) {
++        const int cbuf = c & 1;
++        cp_wait<0>();
++        if (c > 0) {
++            tcgen05_mbar_wait(&mbar[0], phase0);
++            phase0 ^= 1;
++        }
++        __syncthreads();
++
++        const uint32_t* ws = W_base + (size_t)cbuf * W_WORDS;
++        const uint32_t b_slot = cbuf ? b1_smem : b0_smem;
++
++        // Half 0 (gate / down cols 0..127) -> TMEM [taddr, taddr + 64)
++        decode_half(ws, A0_u32, 0);
++        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++        __syncthreads();
++        if (tid == 0) {
++            tcgen05_mma_k32(taddr, a0_smem, b_slot, c > 0);
++            tcgen05_commit(&mbar[0]);
++        }
++
++        // Wait for previous chunk's half 1 to release A1_u32 and opposite B/W slot, then prefetch chunk c + 1.
++        if (c > 0) {
++            tcgen05_mbar_wait(&mbar[1], phase1);
++            phase1 ^= 1;
++        }
++        if (c + 1 < chunks) load_bw(c + 1);
++        cp_commit();
++
++        // Half 1 (up / down cols 128..255) -> TMEM [taddr + 64, taddr + 128), overlapping half 0 MMA & prefetch.
++        decode_half(ws, A1_u32, 1);
++        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++        __syncthreads();
++        if (tid == 0) {
++            const uint32_t b_h1 = b_slot + (uint32_t)(XR == TPM ? 0 : (TPM * TBK * 2));
++            tcgen05_mma_k32(taddr + 64u, a1_smem, b_h1, c > 0);
++            tcgen05_commit(&mbar[1]);
++        }
++    }
++    if (chunks > 0) {
++        tcgen05_mbar_wait(&mbar[0], phase0);
++        tcgen05_mbar_wait(&mbar[1], phase1);
++    }
++    cp_wait<0>();
++    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
++    __syncthreads();
++}
++
++// Spill 32 tokens (half `hf` of TPM=64) from TMEM [taddr, taddr+128) into epilogue SMEM.
++// Warps 0..3 read half_id=0 (TMEM +0), warps 4..7 read half_id=1 (TMEM +64) simultaneously.
++template <int MATS>
++__device__ __forceinline__ void tspill_tcgen05(float* E, int ES, uint32_t taddr, int hf) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int half_id = warp >> 2;
++    const int col = (MATS == 1 ? half_id * 128 : 0) + (warp & 3) * 32 + lane;
++    float* dst = (MATS == 2) ? (E + (size_t)half_id * TPH * ES) : E;
++    const uint32_t base_col = (uint32_t)(half_id * 64 + hf * TPH);
++#pragma unroll
++    for (int sub = 0; sub < 2; ++sub) {
++        uint32_t r[16];
++        tcgen05_ld16(taddr + base_col + (uint32_t)(sub * 16), r);
++#pragma unroll
++        for (int t = 0; t < 16; ++t) dst[(size_t)(sub * 16 + t) * ES + col] = __uint_as_float(r[t]);
++    }
++}
++#else
++#define TF_EXL3_PROMPT_TCGEN05 0
++#endif
++
+ // Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM).
+ template <int MATS, int XR, int K2>
+ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
+@@ -151,16 +369,31 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
+     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+     __syncthreads();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    float* Eg = reinterpret_cast<float*>(smem_raw);
++    const int n = cb * 128 + 4 * lane;
++#if TF_EXL3_PROMPT_TCGEN05
++    __shared__ uint32_t tmem_addr;
++    if (warp == 0) {
++        const uint32_t sh = (uint32_t)__cvta_generic_to_shared(&tmem_addr);
++        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 128;" :: "r"(sh));
++    }
++    __syncthreads();
++    const uint32_t taddr = tmem_addr;
++    tmain_tcgen05<2, XR, K2>(Xg, Xu, Tg, Tu, rows_sh, e, K, N >> 4, cb, xdiv, smem_raw, taddr);
++#else
+     float acc[TMT][TNB][4];
+     tmain<2, XR, K2>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
+-    float* Eg = reinterpret_cast<float*>(smem_raw);
+     int mat, nt;
+     ttile<2>(warp * TMT, cb, mat, nt);
+     const int col0 = (nt - cb * 8) * 16;
+-    const int n = cb * 128 + 4 * lane;
++#endif
+     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
+         if (hf) __syncthreads();   // the first half's rows are read
++#if TF_EXL3_PROMPT_TCGEN05
++        tspill_tcgen05<2>(Eg, GU_ES, taddr, hf);
++#else
+         tspill(Eg + (size_t)mat * TPH * GU_ES, GU_ES, col0, acc, hf);
++#endif
+         __syncthreads();
+         for (int i = warp; i < TPH && hf * TPH + i < cnt; i += TNW) {
+             const int p = rows_sh[hf * TPH + i];
+@@ -191,6 +424,13 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
+             for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+         }
+     }
++#if TF_EXL3_PROMPT_TCGEN05
++    __syncthreads();
++    if (warp == 0) {
++        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 128;" :: "r"(taddr));
++        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
++    }
++#endif
+ }
+ 
+ }  // namespace tf_exl3_prompt
+diff --git a/zig/tests/cuda/glm_exl3_compact.zig b/zig/tests/cuda/glm_exl3_compact.zig
+index b02ed09b0..2a6a0c34a 100644
+--- a/zig/tests/cuda/glm_exl3_compact.zig
++++ b/zig/tests/cuda/glm_exl3_compact.zig
+@@ -10,7 +10,30 @@ const experts = glm.experts;
+ const top_k = glm.exl3.top_k;
+ const chunk_rows = glm.exl3.chunk_rows;
+ fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
+-    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx };
++    return .{
++        .gate = w.gt,
++        .up = w.ut,
++        .down = w.dt,
++        .gate_k2 = w.k2,
++        .up_k2 = w.k2_up,
++        .down_k2 = w.k2_down,
++        .suh_g = w.suh_g,
++        .suh_u = w.suh_u,
++        .svh_g = w.svh_g,
++        .svh_u = w.svh_u,
++        .suh_d = w.suh_d,
++        .svh_d = w.svh_d,
++        .experts = count,
++        .dims = dims,
++        .width = width,
++        .codebook = .mcg,
++        .limit = limit,
++        .act_mode = 0,
++        .uniform_k2 = if (w.uniform_gu == w.uniform_d) w.uniform_gu else 0,
++        .uniform_k2_gu = w.uniform_gu,
++        .uniform_k2_d = w.uniform_d,
++        .shared_input = w.shx,
++    };
+ }
+ fn shape(dims: usize, width: usize) common.Layer {
+     const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
+@@ -51,7 +74,9 @@ pub fn scratchBytes(rows: usize, dims: usize, width: usize, shx: bool) usize {
+     var l = shape(dims, width);
+     l.shared_input = shx;
+     const n: usize = @min(rows, chunk_rows);
+-    return picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable) + n * top_k * dims * 4;
++    const prompt_need = (common.prompt.bytes(l, n, top_k) catch unreachable) + n * top_k * dims * 4;
++    const fallback_need = common.scratchBytes(l, n, top_k) catch unreachable;
++    return picksBytes(rows) + @max(prompt_need, fallback_need);
+ }
+ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, ey: u64) !void {
+     return compact(k, ek, stream, w, sc, plan_buf, x, x_stride, picks, slots, rows, count, dims, width, limit, true, ey);
+-- 
+2.43.0
+

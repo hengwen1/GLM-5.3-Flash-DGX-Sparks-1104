@@ -37,7 +37,72 @@ wfn() {
 }
 worker_reachable() { wssh true >/dev/null 2>&1; }
 
-# --- the link between the Sparks -------------------------------------------------------------------------------------
+# --- the link between the nodes --------------------------------------------------------------------------------------
+# Two kinds of fabric carry the ranks:
+#   ib   both nodes expose an RDMA device (DGX Spark on ConnectX-7): NCCL over verbs + engine RoCE all-gathers.
+#   tcp  at least one node has no RDMA device (Jetson AGX Thor 4x25GbE MGBE): NCCL socket transport + /dev/mgbe_zc.
+rdma_present() { compgen -G '/sys/class/infiniband/*' >/dev/null 2>&1; }
+
+# node_addrs <min speed Mb/s>: this node's IPv4 addresses on up physical netdevs at or above that speed. Self-contained.
+node_addrs() {
+  local min=${1:-0} d n a mtu spd
+  for d in /sys/class/net/*; do
+    n=${d##*/}
+    [[ -e "$d/device" ]] || continue
+    [[ "$(cat "$d/operstate" 2>/dev/null)" == up ]] || continue
+    spd=$(cat "$d/speed" 2>/dev/null || echo 0)
+    case "$spd" in ''|*[!0-9]*) spd=0 ;; esac
+    (( spd >= min )) || continue
+    mtu=$(cat "$d/mtu" 2>/dev/null || echo 1500)
+    while read -r _ _ _ a _; do
+      [[ -n "$a" ]] || continue
+      printf '%s %s %s %s %s\n' "$n" "${a%%/*}" "${a##*/}" "$mtu" "$spd"
+    done < <(ip -o -4 addr show dev "$n" 2>/dev/null)
+  done
+}
+
+# fabric_pairs: direct subnet rail pairs between this node and the worker at or above FABRIC_MIN_SPEED_MBPS.
+fabric_pairs() {
+  { node_addrs "$FABRIC_MIN_SPEED_MBPS"; printf -- '--\n'
+    wfn node_addrs -- "node_addrs $FABRIC_MIN_SPEED_MBPS" 2>/dev/null || true
+  } | python3 -c '
+import ipaddress, sys
+mine, theirs, side = [], [], 0
+for line in sys.stdin:
+    line = line.strip()
+    if line == "--":
+        side = 1; continue
+    p = line.split()
+    if len(p) != 5: continue
+    (mine if side == 0 else theirs).append(p)
+def net(a, pfx):
+    try: return ipaddress.ip_network(f"{a}/{pfx}", strict=False)
+    except ValueError: return None
+def addr(a):
+    try: return ipaddress.ip_address(a)
+    except ValueError: return None
+for dev, ip, pfx, mtu, _ in sorted(mine, key=lambda x: x[0]):
+    ln, la = net(ip, pfx), addr(ip)
+    if ln is None or la is None: continue
+    for wdev, wip, wpfx, wmtu, _ in sorted(theirs, key=lambda x: x[0]):
+        wn, wa = net(wip, wpfx), addr(wip)
+        if wn is None or wa is None or la not in wn or wa not in ln: continue
+        print(dev, ip, wdev, wip, min(int(mtu), int(wmtu)), f"{mtu}/{wmtu}")
+'
+}
+
+tcp_buffer_ceiling() {
+  sysctl -n net.core.rmem_max net.core.wmem_max 2>/dev/null | sort -n | head -1
+}
+
+rail_tcp_buffers() {
+  local here there
+  here=$(tcp_buffer_ceiling || true); here=${here:-0}
+  there=$(wfn tcp_buffer_ceiling -- "tcp_buffer_ceiling" 2>/dev/null || true); there=${there:-0}
+  (( here >= RAIL_TCP_BUFFER_BYTES && there >= RAIL_TCP_BUFFER_BYTES )) && return 0
+  warn W_TCP_BUFFER "The socket buffer ceiling is $here bytes here and $there on $(worker_host); the rails want $RAIL_TCP_BUFFER_BYTES on both. Raise with: sudo sysctl -w net.core.rmem_max=$RAIL_TCP_BUFFER_BYTES net.core.wmem_max=$RAIL_TCP_BUFFER_BYTES."
+}
+
 # link_info <peer address>: this node's side of the link to <peer>: "<address> <netdev> <rdma device> <gid index>".
 # The netdev and source address come from the route to the peer; the RDMA device from sysfs; the GID index is the
 # RoCE v2 entry that holds this node's own IPv4 address (an all-zero or v1 entry makes NCCL fail about a minute in).
@@ -128,37 +193,87 @@ cx7_peer() {
   return 1
 }
 
-# Filled by detect_link: this Spark's and the worker's side of the link.
+# Filled by detect_link: this node's and the worker's side of the link.
 LINK_SELF= LINK_PEER= LINK_DEV= LINK_HCA= LINK_GID=
 WORKER_DEV= WORKER_HCA= WORKER_GID=
+LINK_KIND='' LINK_ZC_PORTS='' WORKER_ZC_PORTS=''
 
 # detect_link: FABRIC_PEER / FABRIC_SELF / NCCL_SOCKET_IFNAME / TF_ROCE_HCA / NCCL_IB_GID_INDEX, each kept when it was
 # set by hand. Rails past the first are probed and dropped when they do not reach the peer's matching rail.
 detect_link() {
   local peer self dev hca gid whca wgid wdev info winfo
-  peer=$FABRIC_PEER
-  if [[ -z "$peer" ]]; then
-    peer=$(cx7_peer || true)
-    [[ -n "$peer" ]] || fail E_FABRIC "Found no ConnectX-7 address of $(worker_host) that a port of this Spark reaches directly. Cable the two Sparks and give them addresses on one subnet, or set FABRIC_PEER to the worker's address on the link."
+  if rdma_present && wsh 'ls -d /sys/class/infiniband/* >/dev/null 2>&1'; then
+    LINK_KIND=ib
+    peer=$FABRIC_PEER
+    if [[ -z "$peer" ]]; then
+      peer=$(cx7_peer || true)
+      [[ -n "$peer" ]] || fail E_FABRIC "Found no RDMA address of $(worker_host) that a port of this node reaches directly. Cable the two nodes and give them addresses on one subnet, or set FABRIC_PEER to the worker's address on the link."
+    fi
+    info=$(link_info "$peer") || fail E_FABRIC "No route to $peer: check the link to $(worker_host), or set FABRIC_PEER."
+    read -r self dev hca gid <<< "$info"
+    [[ "$hca" != - ]] || fail E_FABRIC "The route to $peer leaves over $dev, which is not an RDMA port. Set FABRIC_PEER to the worker's address on the direct link."
+    [[ "$gid" != - ]] || fail E_FABRIC "$hca has no RoCE v2 GID holding $self. Give the link's port an IPv4 address on both nodes, or set NCCL_IB_GID_INDEX by hand."
+    winfo=$(wfn link_info -- "link_info $self") || fail E_FABRIC "Could not read $(worker_host)'s side of the link to $self."
+    read -r _ wdev whca wgid <<< "$winfo"
+    [[ "$whca" != - && "$wgid" != - ]] || fail E_FABRIC "$(worker_host)'s route back to $self does not leave over an RDMA port with a RoCE v2 GID ($wdev/$whca, gid $wgid)."
+    LINK_SELF=${FABRIC_SELF:-$self}; LINK_PEER=$peer
+    LINK_DEV=${NCCL_SOCKET_IFNAME:-$dev}; WORKER_DEV=$wdev
+    LINK_GID=${NCCL_IB_GID_INDEX:-$gid}; WORKER_GID=${NCCL_IB_GID_INDEX:-$wgid}
+    if [[ -n "$TF_ROCE_HCA" ]]; then
+      LINK_HCA=$TF_ROCE_HCA; WORKER_HCA=$TF_ROCE_HCA
+    else
+      LINK_HCA=$(rails "$LINK_DEV" "$LINK_GID"); [[ -n "$LINK_HCA" ]] || LINK_HCA=$hca
+      WORKER_HCA=$(wfn rails -- "rails $(printf '%q' "$wdev") $(printf '%q' "$WORKER_GID")"); [[ -n "$WORKER_HCA" ]] || WORKER_HCA=$whca
+      probe_rails
+    fi
+    [[ "$ROCE" != auto ]] || ROCE=on
+    [[ "$MGBE_ZC" != auto ]] || MGBE_ZC=off
+    log "[I_FABRIC] Link (RDMA): $LINK_SELF ($LINK_DEV) <-> $LINK_PEER ($WORKER_DEV); RDMA $LINK_HCA <-> $WORKER_HCA, RoCE v2 GID $LINK_GID/$WORKER_GID."
+    return 0
   fi
-  info=$(link_info "$peer") || fail E_FABRIC "No route to $peer: check the link to $(worker_host), or set FABRIC_PEER."
-  read -r self dev hca gid <<< "$info"
-  [[ "$hca" != - ]] || fail E_FABRIC "The route to $peer leaves over $dev, which is not an RDMA port. Set FABRIC_PEER to the worker's address on the Sparks' direct link."
-  [[ "$gid" != - ]] || fail E_FABRIC "$hca has no RoCE v2 GID holding $self. Give the link's port an IPv4 address on both Sparks, or set NCCL_IB_GID_INDEX by hand."
-  winfo=$(wfn link_info -- "link_info $self") || fail E_FABRIC "Could not read $(worker_host)'s side of the link to $self."
-  read -r _ wdev whca wgid <<< "$winfo"
-  [[ "$whca" != - && "$wgid" != - ]] || fail E_FABRIC "$(worker_host)'s route back to $self does not leave over an RDMA port with a RoCE v2 GID ($wdev/$whca, gid $wgid)."
-  LINK_SELF=${FABRIC_SELF:-$self}; LINK_PEER=$peer
-  LINK_DEV=${NCCL_SOCKET_IFNAME:-$dev}; WORKER_DEV=$wdev
-  LINK_GID=${NCCL_IB_GID_INDEX:-$gid}; WORKER_GID=${NCCL_IB_GID_INDEX:-$wgid}
-  if [[ -n "$TF_ROCE_HCA" ]]; then
-    LINK_HCA=$TF_ROCE_HCA; WORKER_HCA=$TF_ROCE_HCA
+  detect_link_tcp
+}
+
+detect_link_tcp() {
+  local -a keep=() pairs=() zc_local=() zc_worker=()
+  local rail dev ip wdev wip mtu mtus ok first=1
+  mapfile -t pairs < <(fabric_pairs)
+  (( ${#pairs[@]} )) || fail E_FABRIC "Found no port at or above ${FABRIC_MIN_SPEED_MBPS} Mb/s that reaches $(worker_host) directly (no gateway). Cable the two nodes on one subnet and give both sides an address, or lower FABRIC_MIN_SPEED_MBPS."
+  for rail in "${pairs[@]}"; do
+    read -r dev ip wdev wip mtu mtus <<< "$rail"
+    [[ -z "$FABRIC_PEER" || "$wip" == "$FABRIC_PEER" ]] || continue
+    [[ -z "$mtus" || "${mtus%%/*}" == "${mtus##*/}" ]] || \
+      warn W_FABRIC "Rail $dev ($ip) is MTU ${mtus%%/*} and $wdev ($wip) on $(worker_host) is MTU ${mtus##*/}: probing at $mtu."
+    ok=1
+    rail_ping "$dev" "$wip" "$mtu" || ok=0
+    (( ok == 0 )) || wfn rail_ping -- "rail_ping $(printf '%q' "$wdev") $(printf '%q' "$ip") $mtu" || ok=0
+    if (( ok )); then
+      keep+=("$dev $ip $wdev $wip $mtu")
+      (( first == 0 )) || { LINK_SELF=${FABRIC_SELF:-$ip}; LINK_PEER=$wip; first=0; }
+      if [[ "$dev" =~ ^mgbe([0-3])_0$ && "$wdev" =~ ^mgbe([0-3])_0$ && "$mtu" -ge 8256 ]]; then
+        zc_local+=("${dev#mgbe}"); zc_local[-1]="${zc_local[-1]%_0}"
+        zc_worker+=("${wdev#mgbe}"); zc_worker[-1]="${zc_worker[-1]%_0}"
+      fi
+    else
+      warn W_FABRIC "Rail $dev ($ip) <-> $wdev ($wip) on $(worker_host) does not carry a $mtu-byte ping: leaving it out."
+    fi
+  done
+  (( ${#keep[@]} )) || fail E_FABRIC "No rail between this node and $(worker_host) carries a full-size ping. Check cables, addresses and MTU."
+  LINK_KIND=tcp
+  LINK_HCA='' WORKER_HCA='' LINK_GID='' WORKER_GID=''
+  LINK_ZC_PORTS=$(IFS=,; printf '%s' "${zc_local[*]}")
+  WORKER_ZC_PORTS=$(IFS=,; printf '%s' "${zc_worker[*]}")
+  if [[ -n "$NCCL_SOCKET_IFNAME" ]]; then
+    LINK_DEV=$NCCL_SOCKET_IFNAME
+    WORKER_DEV=$(printf '%s\n' "${keep[@]}" | awk -v d="$NCCL_SOCKET_IFNAME" '$1 == d { print $3 }' | paste -sd, -)
+    [[ -n "$WORKER_DEV" ]] || WORKER_DEV=$(printf '%s\n' "${keep[@]}" | awk '{ print $3 }' | paste -sd, -)
   else
-    LINK_HCA=$(rails "$LINK_DEV" "$LINK_GID"); [[ -n "$LINK_HCA" ]] || LINK_HCA=$hca
-    WORKER_HCA=$(wfn rails -- "rails $(printf '%q' "$wdev") $(printf '%q' "$WORKER_GID")"); [[ -n "$WORKER_HCA" ]] || WORKER_HCA=$whca
-    probe_rails
+    LINK_DEV=$(printf '%s\n' "${keep[@]}" | awk '{ print $1 }' | paste -sd, -)
+    WORKER_DEV=$(printf '%s\n' "${keep[@]}" | awk '{ print $3 }' | paste -sd, -)
   fi
-  log "[I_FABRIC] Link: $LINK_SELF ($LINK_DEV) <-> $LINK_PEER ($WORKER_DEV); RDMA $LINK_HCA <-> $WORKER_HCA, RoCE v2 GID $LINK_GID/$WORKER_GID."
+  [[ "$ROCE" != on ]] || warn W_ROCE "ROCE=on but there is no RDMA device on both nodes: running with ROCE=off."
+  ROCE=off
+  log "[I_FABRIC] Link (Ethernet, no RDMA device): ${LINK_SELF} ($LINK_DEV) <-> ${LINK_PEER} ($WORKER_DEV) over ${#keep[@]} rail(s)."
 }
 
 # probe_rails: rail k of this Spark is checked against rail k of the worker, in both directions, before it is used;

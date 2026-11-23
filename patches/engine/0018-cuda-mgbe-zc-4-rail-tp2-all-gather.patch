@@ -1,0 +1,2204 @@
+From b685ae6747a3b553222a92c650a76e51f14b810f Mon Sep 17 00:00:00 2001
+From: test <test@thor.local>
+Date: Sun, 22 Nov 2026 21:09:41 -0500
+Subject: [PATCH] cuda: 4-rail /dev/mgbe_zc zero-copy TP=2 all-gather transport
+
+---
+ zig/src/cuda/abi.zig                         |   39 +
+ zig/src/cuda/driver.zig                      |   13 +-
+ zig/src/cuda/mgbe_zc.zig                     | 1560 ++++++++++++++++++
+ zig/src/cuda/mgbe_zc_uapi.zig                |  111 ++
+ zig/src/cuda/root.zig                        |    4 +
+ zig/src/cuda/tp_group.zig                    |   17 +-
+ zig/src/cuda/tp_watch.zig                    |   14 +-
+ zig/src/families/glm/cuda_engine.zig         |    8 +-
+ zig/src/families/glm/cuda_forward.zig        |    4 +-
+ zig/src/families/glm/cuda_forward_pieces.zig |    1 +
+ zig/src/families/glm/cuda_native.zig         |    3 +
+ zig/tests/cuda/main.zig                      |    2 +
+ zig/tests/cuda/mgbe_zc_gather_tests.zig      |  178 ++
+ 13 files changed, 1943 insertions(+), 11 deletions(-)
+ create mode 100644 zig/src/cuda/mgbe_zc.zig
+ create mode 100644 zig/src/cuda/mgbe_zc_uapi.zig
+ create mode 100644 zig/tests/cuda/mgbe_zc_gather_tests.zig
+
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index 7c7d98a38..c4fbb8976 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -249,6 +249,45 @@ pub const Api = struct {
+     cuGetErrorString: *const fn (R, *?[*:0]const u8) callconv(.c) R,
+ };
+ 
++/// CUDA Virtual Memory Management (VMM) types & optional entry points for CU_MEM_LOCATION_TYPE_HOST_NUMA.
++pub const cu_mem_allocation_type_pinned: c_int = 1;
++pub const cu_mem_location_type_device: c_int = 1;
++pub const cu_mem_location_type_host_numa: c_int = 3;
++pub const cu_mem_access_flags_prot_readwrite: c_int = 3;
++pub const cu_mem_alloc_granularity_minimum: c_int = 0;
++
++pub const MemLocation = extern struct {
++    type: c_int = 0,
++    id: c_int = 0,
++};
++
++pub const MemAllocationProp = extern struct {
++    type: c_int = 0,
++    requested_handle_types: c_int = 0,
++    location: MemLocation = .{},
++    win32_handle_meta_data: ?*anyopaque = null,
++    compression_type: u8 = 0,
++    gpu_direct_rdma_capable: u8 = 0,
++    usage: u16 = 0,
++    reserved: [4]u8 = @splat(0),
++};
++
++pub const MemAccessDesc = extern struct {
++    location: MemLocation = .{},
++    flags: c_int = 0,
++};
++
++pub const VmmApi = struct {
++    cuMemGetAllocationGranularity: *const fn (*usize, *const MemAllocationProp, c_int) callconv(.c) R,
++    cuMemCreate: *const fn (*u64, usize, *const MemAllocationProp, u64) callconv(.c) R,
++    cuMemAddressReserve: *const fn (*u64, usize, usize, u64, u64) callconv(.c) R,
++    cuMemMap: *const fn (u64, usize, usize, u64, u64) callconv(.c) R,
++    cuMemSetAccess: *const fn (u64, usize, [*]const MemAccessDesc, usize) callconv(.c) R,
++    cuMemUnmap: *const fn (u64, usize) callconv(.c) R,
++    cuMemAddressFree: *const fn (u64, usize) callconv(.c) R,
++    cuMemRelease: *const fn (u64) callconv(.c) R,
++};
++
+ comptime {
+     const std = @import("std");
+     std.debug.assert(@sizeOf(LaunchAttribute) == 72 and @offsetOf(LaunchAttribute, "value") == 8);
+diff --git a/zig/src/cuda/driver.zig b/zig/src/cuda/driver.zig
+index 2ee2d530d..7d7ff2594 100644
+--- a/zig/src/cuda/driver.zig
++++ b/zig/src/cuda/driver.zig
+@@ -16,9 +16,20 @@ pub const Driver = struct {
+     api: abi.Api,
+     /// cuFuncGetName (CUDA 12.3+; optional: an older driver opens without it): a failed launch names its kernel
+     func_name: ?FuncGetName = null,
++    /// CUDA VMM entry points (optional; used by mgbe_zc for CU_MEM_LOCATION_TYPE_HOST_NUMA zero-copy regions)
++    vmm: ?abi.VmmApi = null,
+ 
+     pub const FuncGetName = *const fn (*?[*:0]const u8, abi.Function) callconv(.c) abi.Result;
+ 
++    fn lookupVmm(lib: *platform.DynLib) ?abi.VmmApi {
++        var v: abi.VmmApi = undefined;
++        const info = @typeInfo(abi.VmmApi).@"struct";
++        inline for (info.field_names, info.field_types) |name, T| {
++            @field(v, name) = lib.lookup(T, name) orelse return null;
++        }
++        return v;
++    }
++
+     pub fn open() Error!Driver {
+         return openPath(platform.cuda_driver);
+     }
+@@ -35,7 +46,7 @@ pub const Driver = struct {
+                 return error.MissingSymbol;
+             };
+         }
+-        const d: Driver = .{ .lib = lib, .api = api, .func_name = lib.lookup(FuncGetName, "cuFuncGetName") };
++        const d: Driver = .{ .lib = lib, .api = api, .func_name = lib.lookup(FuncGetName, "cuFuncGetName"), .vmm = lookupVmm(&lib) };
+         try d.check(api.cuInit(0), "cuInit");
+         var buf: [256]u8 = undefined;
+         if (d.tooOld(&buf)) |why| {
+diff --git a/zig/src/cuda/mgbe_zc.zig b/zig/src/cuda/mgbe_zc.zig
+new file mode 100644
+index 000000000..e5a8126f2
+--- /dev/null
++++ b/zig/src/cuda/mgbe_zc.zig
+@@ -0,0 +1,1560 @@
++//! Two-rank TP all-gather over /dev/mgbe_zc (4x25GbE zero-copy MGBE on Jetson AGX Thor).
++//!
++//! Reuses kernels.roce_gather on the GPU stream (100% CUDA-Graph capturable) with a 2-slot staging region allocated
++//! via CUDA VMM CU_MEM_LOCATION_TYPE_HOST_NUMA and registered for contiguous 48-bit SMMU IOVA across all active ports:
++//!   - Small stripes (<= TF_MGBE_ZC_EAGER_KB, default 32 KiB/rail): 0.5-RTT raw L2 eager frames on VDMA 2 (0x88B5)
++//!     with zero handshake (~4-6 us 1-way wire latency for decode/verify gathers).
++//!   - Bulk stripes (> TF_MGBE_ZC_EAGER_KB, up to TF_MGBE_ZC_MAX_KB default 16 MiB/rank): hardware split-header
++//!     DDP (SPH=1, 64B header + 8192B payload) directly into recv[slot] SMMU IOVA on VDMA 3 (0x88B6) with CTS/ACK
++//!     and Go-Back-N retransmit (~90 Gbps across 4 rails for prefill gathers).
++const std = @import("std");
++const builtin = @import("builtin");
++const abi = @import("abi.zig");
++const Driver = @import("driver.zig").Driver;
++const memory = @import("memory.zig");
++const Module = @import("module.zig").Module;
++const Function = @import("module.zig").Function;
++const launch = @import("launch.zig");
++const tp_group = @import("tp_group.zig");
++const Stream = @import("stream.zig").Stream;
++const kernels = @import("kernels.zig");
++const nap = @import("roce_nap.zig");
++const uapi = @import("mgbe_zc_uapi.zig");
++
++pub const max_ports = uapi.max_ports;
++const slots: usize = 2;
++const flag_stride: usize = 128;
++const threads: u32 = 512;
++const max_blocks: usize = 8;
++const idle_spins: u64 = 20_000_000;
++const spin_limit: u32 = 40_000_000; // ~23s on Thor HOST_NUMA (> 15s worker timeout)
++const flag_retrans: u8 = 1;
++
++const hdr_bytes: usize = 64;
++const max_payload: usize = 8192;
++const ctrl_rx_stride: usize = 9216; // holds full 64B hdr + 8192B eager jumbo frame (64B aligned)
++const data_rx_stride: usize = 256; // SPH=1 splits 64B header here; 8192B payload lands directly in CUDA HOST_NUMA
++const tx_batch_pkts: u32 = 16;
++const bulk_win_max_pkts: u32 = 512; // 4 MiB per DDP window (fits multiple recovery postings inside 4096-desc ring)
++const wire_magic: u32 = 0x5A433247; // 'ZC2G'
++
++// Per-port anonymous mmap pool layout (40 MiB):
++//   [0 .. 256 KiB)              ctrl_q TX headers  (4096 * 64B)
++//   [256 KiB .. 512 KiB)        data_q TX headers  (4096 * 64B)
++//   [512 KiB .. 1536 KiB)       data_q RX headers  (4096 * 256B)
++//   [2 MiB .. 38 MiB)           ctrl_q RX buffers  (4096 * 9216B)
++const port_pool_bytes: usize = 40 << 20;
++const ctrl_tx_off: usize = 0;
++const data_tx_off: usize = 256 << 10;
++const data_rx_off: usize = 512 << 10;
++const ctrl_rx_off: usize = 2 << 20;
++
++const c_seq: usize = 0;
++const c_nbytes: usize = 1; // + slot
++const c_error: usize = 3;
++const c_hca: usize = 4;
++const c_peer: usize = 5;
++
++const Op = enum(u8) {
++    probe = 0x01,
++    probe_ack = 0x02,
++    eager = 0x10,
++    cts = 0x12,
++    bulk_data = 0x13,
++    ack = 0x14,
++    nack = 0x15,
++};
++
++const WireHdr = extern struct {
++    dst_mac: [6]u8 = @splat(0), // 0..5
++    src_mac: [6]u8 = @splat(0), // 6..11
++    ethertype_be: u16 = 0, // 12..13
++    opcode: u8 = 0, // 14
++    flags: u8 = 0, // 15
++    win_pkts: u16 = 0, // 16..17
++    total_pkts: u16 = 0, // 18..19
++    seq: u32 = 0, // 20..23
++    psn: u32 = 0, // 24..27
++    payload_len: u32 = 0, // 28..31
++    nbytes: u32 = 0, // 32..35
++    win_start: u32 = 0, // 36..39
++    cts_gen: u32 = 0, // 40..43
++    pad: [16]u8 = @splat(0), // 44..59
++    magic: u32 = wire_magic, // 60..63
++};
++
++comptime {
++    std.debug.assert(@sizeOf(WireHdr) == hdr_bytes);
++}
++
++pub const Error = error{
++    UnsupportedPlatform,
++    VmmUnavailable,
++    DeviceUnavailable,
++    NoPorts,
++    IoctlFailed,
++    MmapFailed,
++    MrFailed,
++    ProbeFailed,
++    PeerRefused,
++    ProxyFailed,
++    Misaligned,
++};
++
++/// Two-rank region geometry matching roce_gather.cu (`world = 2`, `peers = 1`, `n_hca = n_ports <= 4`).
++pub const Layout = struct {
++    slot_bytes: usize,
++    recv: usize, // recv[slot][slot_bytes]
++    flags: usize, // flags[slot][rail] * flag_stride
++    send: usize, // send[slot][slot_bytes]
++    ctrl: usize, // ctrl words (flag_stride bytes)
++    total: usize,
++
++    pub fn of(max_bytes: usize) Layout {
++        const s = std.mem.alignForward(usize, @max(max_bytes, 4096), 4096);
++        const flags = slots * s;
++        const send = flags + slots * max_ports * flag_stride;
++        const ctrl = send + slots * s;
++        return .{ .slot_bytes = s, .recv = 0, .flags = flags, .send = send, .ctrl = ctrl, .total = ctrl + flag_stride };
++    }
++
++    pub fn recvAt(l: Layout, slot: usize) usize {
++        return l.recv + slot * l.slot_bytes;
++    }
++
++    pub fn sendAt(l: Layout, slot: usize) usize {
++        return l.send + slot * l.slot_bytes;
++    }
++
++    pub fn flagAt(l: Layout, slot: usize, rail: usize, n_ports: usize) usize {
++        return l.flags + (slot * n_ports + rail) * flag_stride;
++    }
++};
++
++/// TF_MGBE_ZC: 0 disables; 1 requires attempt; unset/auto attempts on TP=2 Linux when /dev/mgbe_zc exists.
++pub fn wanted(world: usize) bool {
++    if (comptime builtin.os.tag != .linux) return false;
++    if (world != 2) return false;
++    const v = std.c.getenv("TF_MGBE_ZC") orelse return true;
++    const s = std.mem.span(v);
++    return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off"));
++}
++
++fn debugOn() bool {
++    const v = std.c.getenv("TF_MGBE_ZC_DEBUG") orelse return false;
++    const s = std.mem.span(v);
++    return s.len > 0 and !std.mem.eql(u8, s, "0");
++}
++
++fn envUsize(name: [:0]const u8, default: usize) usize {
++    const v = std.c.getenv(name) orelse return default;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
++}
++
++/// TF_MGBE_ZC_MAX_KB in bytes (default 16 MiB per rank).
++pub fn maxBytesFromEnv() usize {
++    const kb = envUsize("TF_MGBE_ZC_MAX_KB", 16384);
++    const clamped: usize = @min(kb, 65536);
++    return @max(@as(usize, 64 << 10), clamped << 10);
++}
++
++fn eagerMaxBytesFromEnv() usize {
++    const kb = envUsize("TF_MGBE_ZC_EAGER_KB", 32);
++    const clamped: usize = @min(kb, 128);
++    return clamped << 10; // up to 16 jumbo packets per rail (mask fits u32)
++}
++
++fn timeoutNsFromEnv() u64 {
++    const s = envUsize("TF_MGBE_ZC_TIMEOUT_S", 15);
++    return @as(u64, @max(s, 2)) * 1_000_000_000;
++}
++
++inline fn nowNs() u64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
++}
++
++inline fn dmbOshst() void {
++    if (comptime builtin.cpu.arch == .aarch64) {
++        asm volatile ("dmb oshst" ::: .{ .memory = true });
++    }
++}
++
++inline fn dsbSy() void {
++    if (comptime builtin.cpu.arch == .aarch64) {
++        asm volatile ("dsb sy" ::: .{ .memory = true });
++    }
++}
++
++inline fn mmioWrite32(base: [*]volatile u8, off: usize, val: u32) void {
++    dmbOshst();
++    const p: *volatile u32 = @ptrCast(@alignCast(base + off));
++    p.* = val;
++}
++
++inline fn cacheCleanRange(ptr: [*]const u8, len: usize) void {
++    if (comptime builtin.cpu.arch == .aarch64) {
++        if (len == 0) return;
++        var a: usize = @intFromPtr(ptr) & ~@as(usize, 63);
++        const end: usize = @intFromPtr(ptr) + len;
++        while (a < end) : (a += 64) {
++            asm volatile ("dc cvac, %[a]"
++                :
++                : [a] "r" (a),
++                : .{ .memory = true });
++        }
++        asm volatile ("dsb sy" ::: .{ .memory = true });
++    }
++}
++
++inline fn cacheInvalRange(ptr: [*]const u8, len: usize) void {
++    if (comptime builtin.cpu.arch == .aarch64) {
++        if (len == 0) return;
++        var a: usize = @intFromPtr(ptr) & ~@as(usize, 63);
++        const end: usize = @intFromPtr(ptr) + len;
++        while (a < end) : (a += 64) {
++            asm volatile ("dc civac, %[a]"
++                :
++                : [a] "r" (a),
++                : .{ .memory = true });
++        }
++        asm volatile ("dsb sy\n\tisb" ::: .{ .memory = true });
++    }
++}
++
++fn pinCpu(cpu: i32) void {
++    if (comptime builtin.os.tag != .linux) return;
++    if (cpu < 0 or cpu >= 1024) return;
++    var set: [16]usize = @splat(0);
++    const idx: usize = @intCast(@divTrunc(cpu, @bitSizeOf(usize)));
++    const bit: u6 = @intCast(@mod(cpu, @bitSizeOf(usize)));
++    set[idx] = @as(usize, 1) << bit;
++    _ = std.os.linux.syscall3(.sched_setaffinity, 0, @sizeOf(@TypeOf(set)), @intFromPtr(&set));
++}
++
++fn ioctlCall(fd: i32, req: u32, arg: usize) !void {
++    const rc = std.os.linux.ioctl(fd, req, arg);
++    if (@as(isize, @bitCast(rc)) < 0) return error.IoctlFailed;
++}
++
++fn mmapFile(fd: i32, len: usize, off: u64) ![*]align(4096) u8 {
++    const rc = std.os.linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, @intCast(off));
++    const addr: isize = @bitCast(rc);
++    if (addr < 0) return error.MmapFailed;
++    return @ptrFromInt(rc);
++}
++
++fn mmapAnon(len: usize) ![*]align(4096) u8 {
++    const rc = std.os.linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .POPULATE = true }, -1, 0);
++    const addr: isize = @bitCast(rc);
++    if (addr < 0) return error.MmapFailed;
++    return @ptrFromInt(rc);
++}
++
++fn munmapPtr(ptr: [*]align(4096) u8, len: usize) void {
++    _ = std.os.linux.munmap(ptr, len);
++}
++
++/// CUDA VMM HOST_NUMA buffer: directly accessible by both GPU kernels and /dev/mgbe_zc FOLL_LONGTERM SMMU DMA.
++const HostNumaRegion = struct {
++    d: *const Driver,
++    vmm: abi.VmmApi,
++    handle: u64 = 0,
++    va: u64 = 0,
++    size: usize = 0,
++
++    fn alloc(d: *const Driver, req_bytes: usize) !HostNumaRegion {
++        const vmm = d.vmm orelse return error.VmmUnavailable;
++        var dev: abi.Device = 0;
++        try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
++        var prop: abi.MemAllocationProp = .{
++            .type = abi.cu_mem_allocation_type_pinned,
++            .location = .{ .type = abi.cu_mem_location_type_host_numa, .id = 0 },
++        };
++        var gran: usize = 0;
++        try d.check(vmm.cuMemGetAllocationGranularity(&gran, &prop, abi.cu_mem_alloc_granularity_minimum), "cuMemGetAllocationGranularity");
++        if (gran == 0) return error.VmmUnavailable;
++        const sz = std.mem.alignForward(usize, req_bytes, gran);
++        var handle: u64 = 0;
++        try d.check(vmm.cuMemCreate(&handle, sz, &prop, 0), "cuMemCreate(HOST_NUMA)");
++        errdefer _ = vmm.cuMemRelease(handle);
++        var va: u64 = 0;
++        try d.check(vmm.cuMemAddressReserve(&va, sz, gran, 0, 0), "cuMemAddressReserve");
++        errdefer _ = vmm.cuMemAddressFree(va, sz);
++        try d.check(vmm.cuMemMap(va, sz, 0, handle, 0), "cuMemMap");
++        errdefer _ = vmm.cuMemUnmap(va, sz);
++        var acc = [2]abi.MemAccessDesc{
++            .{ .location = .{ .type = abi.cu_mem_location_type_device, .id = dev }, .flags = abi.cu_mem_access_flags_prot_readwrite },
++            .{ .location = .{ .type = abi.cu_mem_location_type_host_numa, .id = 0 }, .flags = abi.cu_mem_access_flags_prot_readwrite },
++        };
++        try d.check(vmm.cuMemSetAccess(va, sz, &acc, 2), "cuMemSetAccess");
++        const bytes: [*]u8 = @ptrFromInt(va);
++        @memset(bytes[0..sz], 0);
++        return .{ .d = d, .vmm = vmm, .handle = handle, .va = va, .size = sz };
++    }
++
++    fn ptr(r: HostNumaRegion) [*]u8 {
++        return @ptrFromInt(r.va);
++    }
++
++    fn free(r: *HostNumaRegion) void {
++        if (r.va != 0) {
++            _ = r.vmm.cuMemUnmap(r.va, r.size);
++            _ = r.vmm.cuMemAddressFree(r.va, r.size);
++            _ = r.vmm.cuMemRelease(r.handle);
++        }
++        r.* = undefined;
++        r.va = 0;
++    }
++};
++
++const Queue = struct {
++    port: u32 = 0,
++    qidx: u32 = 0,
++    hw_chan: u32 = 0,
++    tx_ring_iova: u64 = 0,
++    rx_ring_iova: u64 = 0,
++    tx_ring: ?[*]align(4096) uapi.HwDesc = null,
++    rx_ring: ?[*]align(4096) uapi.HwDesc = null,
++    reg_page: ?[*]align(4096) u8 = null,
++    ch_reg: [*]volatile u8 = undefined,
++    tx_prod: u32 = 0,
++    tx_cons: u32 = 0,
++    rx_prod: u32 = 0,
++    rx_cons: u32 = 0,
++    tx_hdr_va: [*]u8 = undefined,
++    tx_hdr_iova: u64 = 0,
++    rx_buf_va: [*]u8 = undefined,
++    rx_buf_iova: u64 = 0,
++    rx_stride: usize = 0,
++    started: bool = false,
++    tx_desc_cnt: [uapi.ring_desc_cnt]u8 = @splat(0),
++
++    fn setup(q: *Queue, fd: i32, port: u32, qidx: u32, sph: bool, tx_va: [*]u8, tx_iova: u64, rx_va: [*]u8, rx_iova: u64, rx_stride: usize) !void {
++        q.* = .{
++            .port = port,
++            .qidx = qidx,
++            .tx_hdr_va = tx_va,
++            .tx_hdr_iova = tx_iova,
++            .rx_buf_va = rx_va,
++            .rx_buf_iova = rx_iova,
++            .rx_stride = rx_stride,
++        };
++        var qa: uapi.QueueAlloc = .{ .port = port, .qidx = qidx };
++        try ioctlCall(fd, uapi.ioc_queue_alloc, @intFromPtr(&qa));
++        q.hw_chan = qa.hw_chan;
++        q.tx_ring_iova = qa.tx_ring_iova;
++        q.rx_ring_iova = qa.rx_ring_iova;
++        q.tx_ring = @ptrCast(try mmapFile(fd, uapi.ring_bytes, qa.mmap_tx_off));
++        errdefer if (q.tx_ring) |p| munmapPtr(@ptrCast(p), uapi.ring_bytes);
++        q.rx_ring = @ptrCast(try mmapFile(fd, uapi.ring_bytes, qa.mmap_rx_off));
++        errdefer if (q.rx_ring) |p| munmapPtr(@ptrCast(p), uapi.ring_bytes);
++        q.reg_page = try mmapFile(fd, uapi.reg_map_bytes, qa.mmap_reg_off);
++        errdefer if (q.reg_page) |p| munmapPtr(p, uapi.reg_map_bytes);
++        q.ch_reg = @as([*]volatile u8, @ptrCast(q.reg_page.?)) + qa.ch_reg_off;
++
++        var init_tail: u32 = 0;
++        if (!sph) {
++            const rx = q.rx_ring.?;
++            for (0..uapi.ring_desc_cnt - 1) |i| {
++                const b = rx_iova + @as(u64, i) * rx_stride;
++                rx[i] = .{
++                    .d0 = @truncate(b),
++                    .d1 = @truncate(b >> 32),
++                    .d2 = 0,
++                    .d3 = uapi.desc_own,
++                };
++            }
++            rx[uapi.ring_desc_cnt - 1].d3 = 0;
++            q.rx_prod = uapi.ring_desc_cnt - 1;
++            q.rx_cons = 0;
++            init_tail = uapi.ring_desc_cnt - 1;
++        }
++        dsbSy();
++        var qs: uapi.QueueStart = .{
++            .port = port,
++            .qidx = qidx,
++            .rx_buf_size = 9216,
++            .sph_enable = if (sph) 1 else 0,
++            .sph_split_bytes = if (sph) hdr_bytes else 0,
++            .init_rx_tail_idx = init_tail,
++        };
++        try ioctlCall(fd, uapi.ioc_queue_start, @intFromPtr(&qs));
++        q.started = true;
++    }
++
++    fn teardown(q: *Queue, fd: i32) void {
++        if (q.started and fd >= 0) {
++            var qst: uapi.QueueStop = .{ .port = q.port, .qidx = q.qidx };
++            _ = std.os.linux.ioctl(fd, uapi.ioc_queue_stop, @intFromPtr(&qst));
++            q.started = false;
++        }
++        if (q.reg_page) |p| munmapPtr(p, uapi.reg_map_bytes);
++        if (q.rx_ring) |p| munmapPtr(@ptrCast(p), uapi.ring_bytes);
++        if (q.tx_ring) |p| munmapPtr(@ptrCast(p), uapi.ring_bytes);
++        q.reg_page = null;
++        q.rx_ring = null;
++        q.tx_ring = null;
++    }
++
++    fn reclaimTx(q: *Queue) void {
++        const tx = q.tx_ring.?;
++        while (q.tx_cons != q.tx_prod) {
++            const c0 = q.tx_cons & uapi.ring_mask;
++            const cnt: u32 = q.tx_desc_cnt[c0];
++            const last = (q.tx_cons +% cnt -% 1) & uapi.ring_mask;
++            if ((@atomicLoad(u32, &tx[last].d3, .acquire) & uapi.desc_own) != 0) break;
++            q.tx_cons +%= cnt;
++        }
++    }
++
++    fn ringTx(q: *Queue) void {
++        const tail = q.tx_prod & uapi.ring_mask;
++        mmioWrite32(q.ch_reg, uapi.ch_tdtlp, @truncate(q.tx_ring_iova +% @as(u64, tail) * 16));
++    }
++
++    fn ringRx(q: *Queue) void {
++        const tail = q.rx_prod & uapi.ring_mask;
++        mmioWrite32(q.ch_reg, uapi.ch_rdtlp, @truncate(q.rx_ring_iova +% @as(u64, tail) * 16));
++    }
++
++    fn sendCtrlHdr(q: *Queue, local_mac: [6]u8, peer_mac: [6]u8, in: WireHdr) void {
++        while ((q.tx_prod -% q.tx_cons) >= (uapi.ring_desc_cnt - 8)) q.reclaimTx();
++        const idx = q.tx_prod & uapi.ring_mask;
++        const h: *WireHdr = @ptrCast(@alignCast(q.tx_hdr_va + @as(usize, idx) * hdr_bytes));
++        h.* = in;
++        h.dst_mac = peer_mac;
++        h.src_mac = local_mac;
++        h.ethertype_be = std.mem.nativeToBig(u16, uapi.ethtype_ctrl);
++        h.payload_len = 0;
++        h.magic = wire_magic;
++        cacheCleanRange(@ptrCast(h), hdr_bytes);
++
++        const hiova = q.tx_hdr_iova + @as(u64, idx) * hdr_bytes;
++        const tx = q.tx_ring.?;
++        q.tx_desc_cnt[idx] = 1;
++        tx[idx].d0 = @truncate(hiova);
++        tx[idx].d1 = @truncate(hiova >> 32);
++        tx[idx].d2 = hdr_bytes;
++        dsbSy();
++        @atomicStore(u32, &tx[idx].d3, uapi.desc_own | uapi.desc_fd | uapi.desc_ld | hdr_bytes, .release);
++        q.tx_prod +%= 1;
++        q.ringTx();
++    }
++
++    fn sendGather(q: *Queue, ethertype: u16, local_mac: [6]u8, peer_mac: [6]u8, in: WireHdr, pay_iova: u64, plen: u32, ring_db: bool) void {
++        if (plen == 0) {
++            q.sendCtrlHdr(local_mac, peer_mac, in);
++            return;
++        }
++        while ((q.tx_prod -% q.tx_cons) >= (uapi.ring_desc_cnt - 8)) q.reclaimTx();
++        const d0 = q.tx_prod & uapi.ring_mask;
++        const d1 = (q.tx_prod +% 1) & uapi.ring_mask;
++        const h: *WireHdr = @ptrCast(@alignCast(q.tx_hdr_va + @as(usize, d0) * hdr_bytes));
++        h.* = in;
++        h.dst_mac = peer_mac;
++        h.src_mac = local_mac;
++        h.ethertype_be = std.mem.nativeToBig(u16, ethertype);
++        h.payload_len = plen;
++        h.magic = wire_magic;
++        cacheCleanRange(@ptrCast(h), hdr_bytes);
++
++        const tx = q.tx_ring.?;
++        q.tx_desc_cnt[d0] = 2;
++        tx[d1].d0 = @truncate(pay_iova);
++        tx[d1].d1 = @truncate(pay_iova >> 32);
++        tx[d1].d2 = plen & uapi.tdes2_b1l_mask;
++        tx[d1].d3 = uapi.desc_own | uapi.desc_ld;
++        dmbOshst();
++
++        const hiova = q.tx_hdr_iova + @as(u64, d0) * hdr_bytes;
++        tx[d0].d0 = @truncate(hiova);
++        tx[d0].d1 = @truncate(hiova >> 32);
++        tx[d0].d2 = hdr_bytes;
++        dsbSy();
++        const fl: u32 = (@as(u32, hdr_bytes) + plen) & uapi.tdes3_fl_mask;
++        @atomicStore(u32, &tx[d0].d3, uapi.desc_own | uapi.desc_fd | fl, .release);
++        q.tx_prod +%= 2;
++        if (ring_db) q.ringTx();
++    }
++
++    const CtrlRx = struct { hdr: WireHdr, payload: []const u8, valid: bool };
++
++    fn peekCtrl(q: *Queue) ?CtrlRx {
++        const rx = q.rx_ring.?;
++        const idx = q.rx_cons & uapi.ring_mask;
++        const d3 = @atomicLoad(u32, &rx[idx].d3, .acquire);
++        if ((d3 & uapi.desc_own) != 0) return null;
++
++        const slot_va = q.rx_buf_va + @as(usize, idx) * q.rx_stride;
++        const wlen: usize = d3 & uapi.rdes3_pl_mask;
++        const inv_len = @min(q.rx_stride, @max(hdr_bytes, wlen));
++        cacheInvalRange(slot_va, inv_len);
++        const h: *const WireHdr = @ptrCast(@alignCast(slot_va));
++        const ok = (d3 & uapi.rdes3_es_mgbe) == 0 and (d3 & uapi.desc_ctxt) == 0 and
++            wlen >= hdr_bytes and h.magic == wire_magic and wlen >= hdr_bytes + h.payload_len;
++        const plen: usize = if (ok) h.payload_len else 0;
++        return .{ .hdr = if (ok) h.* else .{}, .payload = (slot_va + hdr_bytes)[0..plen], .valid = ok };
++    }
++
++    fn consumeCtrl(q: *Queue) void {
++        const rx = q.rx_ring.?;
++        const idx = q.rx_cons & uapi.ring_mask;
++        rx[idx].d3 = 0;
++
++        const refill = q.rx_prod & uapi.ring_mask;
++        cacheInvalRange(q.rx_buf_va + @as(usize, refill) * q.rx_stride, hdr_bytes);
++        const b = q.rx_buf_iova + @as(u64, refill) * q.rx_stride;
++        rx[refill].d0 = @truncate(b);
++        rx[refill].d1 = @truncate(b >> 32);
++        rx[refill].d2 = 0;
++        dsbSy();
++        @atomicStore(u32, &rx[refill].d3, uapi.desc_own, .release);
++
++        q.rx_cons +%= 1;
++        q.rx_prod +%= 1;
++        q.ringRx();
++    }
++
++    fn postDdpRx(q: *Queue, dst_iova: u64, npkts: u32) void {
++        const rx = q.rx_ring.?;
++        for (0..npkts) |k| {
++            const idx = q.rx_prod & uapi.ring_mask;
++            cacheInvalRange(q.rx_buf_va + @as(usize, idx) * q.rx_stride, hdr_bytes + 64);
++            const hiova = q.rx_buf_iova + @as(u64, idx) * q.rx_stride;
++            const piova = dst_iova + @as(u64, k) * max_payload;
++            rx[idx].d0 = @truncate(hiova);
++            rx[idx].d1 = @truncate(hiova >> 32);
++            rx[idx].d2 = @truncate(piova);
++            dmbOshst();
++            @atomicStore(u32, &rx[idx].d3, (@as(u32, @truncate(piova >> 32)) & 0xFFFF) | uapi.desc_own, .release);
++            q.rx_prod +%= 1;
++        }
++        const tail = q.rx_prod & uapi.ring_mask;
++        rx[tail].d3 = 0;
++        q.ringRx();
++    }
++
++    const DataComp = struct { hdr: WireHdr, plen: u32, err: bool };
++
++    fn pollDataRx(q: *Queue) ?DataComp {
++        const rx = q.rx_ring.?;
++        while (q.rx_cons != q.rx_prod) {
++            const idx = q.rx_cons & uapi.ring_mask;
++            const d3 = @atomicLoad(u32, &rx[idx].d3, .acquire);
++            if ((d3 & uapi.desc_own) != 0) return null;
++            q.rx_cons +%= 1;
++            if ((d3 & uapi.desc_ctxt) != 0) continue;
++            const hva = q.rx_buf_va + @as(usize, idx) * q.rx_stride;
++            cacheInvalRange(hva, hdr_bytes);
++            const h: *const WireHdr = @ptrCast(@alignCast(hva));
++            const wpl: u32 = d3 & uapi.rdes3_pl_mask;
++            const plen: u32 = if (wpl >= @as(u32, hdr_bytes)) wpl - @as(u32, hdr_bytes) else 0;
++            const bad = (d3 & uapi.rdes3_es_mgbe) != 0 or h.magic != wire_magic;
++            return .{ .hdr = h.*, .plen = plen, .err = bad };
++        }
++        return null;
++    }
++};
++
++const EagerSlot = struct {
++    seq: u32 = 0,
++    mask: u32 = 0,
++    total_pkts: u16 = 0,
++};
++
++const EagerTxHist = struct {
++    seq: u32 = 0,
++    nbytes: u32 = 0,
++    off: usize = 0,
++    len: usize = 0,
++};
++
++const StashedCts = struct {
++    valid: bool = false,
++    seq: u32 = 0,
++    win_start: u32 = 0,
++    win_pkts: u16 = 0,
++    cts_gen: u32 = 0,
++};
++
++const Rail = struct {
++    rail_idx: usize = 0,
++    port: u32 = 0,
++    local_mac: [6]u8 = @splat(0),
++    peer_mac: [6]u8 = @splat(0),
++    ifname: [16]u8 = @splat(0),
++    pool_va: ?[*]align(4096) u8 = null,
++    pool_mr_id: u32 = 0,
++    pool_iova: u64 = 0,
++    region_iova: u64 = 0,
++    ctrl_q: Queue = .{},
++    data_q: Queue = .{},
++    last_seq: u32 = 0,
++    pin_cpu: i32 = -1,
++    eager_rx: [slots]EagerSlot = @splat(.{}),
++    eager_tx_hist: [slots]EagerTxHist = @splat(.{}),
++    stashed_cts: StashedCts = .{},
++    stashed_ack_seq: u32 = 0,
++    stashed_ack_win: u32 = 0,
++    has_stashed_ack: bool = false,
++    stashed_nack_seq: u32 = 0,
++    stashed_nack_win: u32 = 0,
++    stashed_nack_flush: u16 = 0,
++    stashed_nack_gen: u32 = 0,
++    has_stashed_nack: bool = false,
++    peer_max_seq: u32 = 0,
++    thread: ?std.Thread = null,
++    eager_cnt: u64 = 0,
++    ddp_cnt: u64 = 0,
++    retrans_cnt: u64 = 0,
++};
++
++const Blob = extern struct {
++    ok: u32,
++    n_ports: u32,
++    slot_bytes: u64,
++    max_bytes: u64,
++    port_ids: [max_ports]u32,
++    macs: [max_ports][6]u8,
++};
++
++fn stripeFor(nbytes: usize, rail: usize, n_ports: usize) struct { off: usize, len: usize } {
++    const packs = nbytes / 16;
++    const base = packs / n_ports;
++    const rem = packs % n_ports;
++    const before = rail * base + @min(rail, rem);
++    const mine = base + @as(usize, if (rail < rem) 1 else 0);
++    return .{ .off = before * 16, .len = mine * 16 };
++}
++
++fn parseCsvU32(text: []const u8, out: []u32) usize {
++    var n: usize = 0;
++    var it = std.mem.tokenizeScalar(u8, text, ',');
++    while (it.next()) |tok| {
++        if (n >= out.len) break;
++        const trimmed = std.mem.trim(u8, tok, " \t\r\n");
++        if (trimmed.len == 0) continue;
++        out[n] = std.fmt.parseInt(u32, trimmed, 10) catch continue;
++        n += 1;
++    }
++    return n;
++}
++
++fn parseCsvI32(text: []const u8, out: []i32) usize {
++    var n: usize = 0;
++    var it = std.mem.tokenizeScalar(u8, text, ',');
++    while (it.next()) |tok| {
++        if (n >= out.len) break;
++        const trimmed = std.mem.trim(u8, tok, " \t\r\n");
++        if (trimmed.len == 0) continue;
++        out[n] = std.fmt.parseInt(i32, trimmed, 10) catch continue;
++        n += 1;
++    }
++    return n;
++}
++
++pub const Gather = struct {
++    gpa: std.mem.Allocator,
++    d: *const Driver,
++    rank: u8,
++    fd: i32 = -1,
++    n_ports: u32 = 0,
++    rails: [max_ports]Rail = @splat(.{}),
++    layout: Layout,
++    region: HostNumaRegion,
++    region_mr_id: u32 = 0,
++    counters: memory.DeviceBuffer,
++    module: Module,
++    f: Function,
++    max_bytes: usize,
++    eager_max: usize,
++    timeout_ns: u64,
++    debug: bool,
++    running: std.atomic.Value(bool) = .init(false),
++    failed: std.atomic.Value(bool) = .init(false),
++    err: [256]u8 = @splat(0),
++    gathers: u64 = 0,
++
++    pub fn init(gpa: std.mem.Allocator, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize) !?*Gather {
++        if (comptime builtin.os.tag != .linux) return null;
++        if (group.world != 2) return null;
++        const g = try gpa.create(Gather);
++        var mine: Blob = std.mem.zeroes(Blob);
++        const ok = want and blk: {
++            g.setup(gpa, d, @intCast(group.rank), max_bytes) catch |e| {
++                std.log.warn("mgbe_zc all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
++                break :blk false;
++            };
++            break :blk true;
++        };
++        if (ok) g.fillBlob(&mine);
++        var all: [2]Blob = undefined;
++        group.gather(Blob, d, s, mine, &all) catch |e| {
++            if (ok) g.teardown();
++            gpa.destroy(g);
++            return e;
++        };
++        const peer = all[1 - group.rank];
++        if (!ok or peer.ok == 0 or peer.n_ports != mine.n_ports or peer.slot_bytes != mine.slot_bytes) {
++            if (ok) g.teardown();
++            gpa.destroy(g);
++            return null;
++        }
++        g.max_bytes = @intCast(@min(mine.max_bytes, peer.max_bytes));
++        for (0..g.n_ports) |r| {
++            g.rails[r].peer_mac = peer.macs[r];
++        }
++        // Barrier before probe so both peers have queues started and peer MACs loaded.
++        var ready_words: [2]u32 = undefined;
++        group.gather(u32, d, s, 1, &ready_words) catch |e| {
++            g.teardown();
++            gpa.destroy(g);
++            return e;
++        };
++        const probed: u32 = blk: {
++            g.probeAll() catch |e| {
++                std.log.err("mgbe_zc all-gather probe: {s} ({s})", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
++                break :blk 0;
++            };
++            break :blk 1;
++        };
++        var verdicts: [2]u32 = undefined;
++        group.gather(u32, d, s, probed, &verdicts) catch |e| {
++            g.teardown();
++            gpa.destroy(g);
++            return e;
++        };
++        if (verdicts[0] == 0 or verdicts[1] == 0) {
++            g.teardown();
++            gpa.destroy(g);
++            std.log.warn("mgbe_zc all-gather: wire probe failed on a rank; NCCL carries every gather", .{});
++            return null;
++        }
++        g.startWorkers() catch |e| {
++            g.teardown();
++            gpa.destroy(g);
++            return e;
++        };
++        std.log.info("mgbe_zc all-gather: 2 ranks, {d} rail(s), shards up to {d} KiB (eager <= {d} KiB/rail, DDP above)", .{
++            g.n_ports, g.max_bytes >> 10, g.eager_max >> 10,
++        });
++        return g;
++    }
++
++    fn fail(g: *Gather, comptime fmt: []const u8, args: anytype) void {
++        _ = std.fmt.bufPrint(g.err[0 .. g.err.len - 1], fmt, args) catch {};
++    }
++
++    fn ctrl(g: *Gather) [*]u32 {
++        return @ptrCast(@alignCast(g.region.ptr() + g.layout.ctrl));
++    }
++
++    fn setup(g: *Gather, gpa: std.mem.Allocator, d: *const Driver, rank: u8, max_bytes: usize) !void {
++        g.* = .{
++            .gpa = gpa,
++            .d = d,
++            .rank = rank,
++            .layout = Layout.of(max_bytes),
++            .region = undefined,
++            .counters = undefined,
++            .module = undefined,
++            .f = undefined,
++            .max_bytes = max_bytes,
++            .eager_max = eagerMaxBytesFromEnv(),
++            .timeout_ns = timeoutNsFromEnv(),
++            .debug = debugOn(),
++        };
++        const fd_rc = std.os.linux.open(uapi.dev_path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
++        const fd_signed: isize = @bitCast(fd_rc);
++        if (fd_signed < 0) {
++            g.fail("open {s} failed (errno {d})", .{ uapi.dev_path, -fd_signed });
++            return error.DeviceUnavailable;
++        }
++        g.fd = @intCast(fd_signed);
++        errdefer {
++            _ = std.os.linux.close(g.fd);
++            g.fd = -1;
++        }
++
++        // Discover requested or all present+up+MTU9000+SPH ports.
++        var want_ports: [max_ports]u32 = .{ 0, 1, 2, 3 };
++        var n_want: usize = max_ports;
++        if (std.c.getenv("TF_MGBE_ZC_PORTS")) |v| {
++            const parsed = parseCsvU32(std.mem.span(v), &want_ports);
++            if (parsed > 0) n_want = parsed;
++        }
++        var cpus: [max_ports]i32 = @splat(-1);
++        if (std.c.getenv("TF_MGBE_ZC_CPUS")) |v| {
++            _ = parseCsvI32(std.mem.span(v), &cpus);
++        }
++
++        var count: u32 = 0;
++        for (want_ports[0..n_want]) |p| {
++            if (p >= max_ports) continue;
++            var pi: uapi.PortInfo = .{ .port = p };
++            ioctlCall(g.fd, uapi.ioc_port_info, @intFromPtr(&pi)) catch continue;
++            if (pi.present == 0 or pi.link_up == 0 or pi.sph_supported == 0 or pi.mtu < 8256) continue;
++            g.rails[count] = .{
++                .rail_idx = count,
++                .port = p,
++                .local_mac = pi.mac,
++                .ifname = pi.ifname,
++                .pin_cpu = cpus[count],
++            };
++            count += 1;
++        }
++        if (count == 0) {
++            g.fail("no up MGBE port with MTU>=8256 and SPH=1", .{});
++            return error.NoPorts;
++        }
++        g.n_ports = count;
++
++        // Allocate GPU+NIC shared HOST_NUMA region and register MR once across all ports.
++        g.region = HostNumaRegion.alloc(d, g.layout.total) catch |e| {
++            g.fail("CUDA HOST_NUMA alloc ({d} B) failed: {s}", .{ g.layout.total, @errorName(e) });
++            return e;
++        };
++        errdefer g.region.free();
++
++        var rmr: uapi.MrReq = .{ .va = g.region.va, .len = g.region.size, .dmabuf_fd = -1 };
++        ioctlCall(g.fd, uapi.ioc_reg_mr, @intFromPtr(&rmr)) catch {
++            g.fail("REG_MR region ({d} B) failed", .{g.region.size});
++            return error.MrFailed;
++        };
++        g.region_mr_id = rmr.mr_id;
++        errdefer _ = std.os.linux.ioctl(g.fd, uapi.ioc_dereg_mr, @intFromPtr(&g.region_mr_id));
++
++        g.counters = try memory.DeviceBuffer.alloc(d, 64 * 4);
++        errdefer g.counters.free();
++        const zeros: [64 * 4]u8 = @splat(0);
++        try g.counters.upload(0, &zeros);
++
++        g.module = try Module.load(d, kernels.roce_gather);
++        errdefer g.module.unload();
++        g.f = try g.module.function("roce_gather");
++
++        errdefer g.teardownRails();
++        for (0..g.n_ports) |r| {
++            const rl = &g.rails[r];
++            rl.region_iova = rmr.iova[rl.port];
++            rl.pool_va = try mmapAnon(port_pool_bytes);
++            @memset(rl.pool_va.?[0..port_pool_bytes], 0);
++            cacheInvalRange(rl.pool_va.?, port_pool_bytes);
++            var pmr: uapi.MrReq = .{ .va = @intFromPtr(rl.pool_va.?), .len = port_pool_bytes, .dmabuf_fd = -1 };
++            ioctlCall(g.fd, uapi.ioc_reg_mr, @intFromPtr(&pmr)) catch {
++                g.fail("REG_MR port {d} header pool failed", .{rl.port});
++                return error.MrFailed;
++            };
++            rl.pool_mr_id = pmr.mr_id;
++            rl.pool_iova = pmr.iova[rl.port];
++            try rl.ctrl_q.setup(
++                g.fd,
++                rl.port,
++                0,
++                false,
++                rl.pool_va.? + ctrl_tx_off,
++                rl.pool_iova + ctrl_tx_off,
++                rl.pool_va.? + ctrl_rx_off,
++                rl.pool_iova + ctrl_rx_off,
++                ctrl_rx_stride,
++            );
++            try rl.data_q.setup(
++                g.fd,
++                rl.port,
++                1,
++                true,
++                rl.pool_va.? + data_tx_off,
++                rl.pool_iova + data_tx_off,
++                rl.pool_va.? + data_rx_off,
++                rl.pool_iova + data_rx_off,
++                data_rx_stride,
++            );
++        }
++    }
++
++    fn fillBlob(g: *Gather, b: *Blob) void {
++        b.ok = 1;
++        b.n_ports = g.n_ports;
++        b.slot_bytes = g.layout.slot_bytes;
++        b.max_bytes = g.max_bytes;
++        for (0..g.n_ports) |r| {
++            b.port_ids[r] = g.rails[r].port;
++            b.macs[r] = g.rails[r].local_mac;
++        }
++    }
++
++    /// Bidirectional L2 ctrl + DDP probe on every rail before arming workers.
++    fn probeAll(g: *Gather) !void {
++        for (0..g.n_ports) |r| {
++            try g.probeRail(&g.rails[r]);
++        }
++        // Reset staging bytes used by the probe so sequence 1 starts clean.
++        @memset(g.region.ptr()[0..g.layout.total], 0);
++        cacheCleanRange(g.region.ptr(), g.layout.total);
++    }
++
++    fn probeRail(g: *Gather, rl: *Rail) !void {
++        const deadline = nowNs() + 5_000_000_000;
++        // 1. Ctrl L2 ping-pong verifying peer MAC pairing.
++        var got_peer_probe = false;
++        var got_ack = false;
++        var last_tx: u64 = 0;
++        while (!(got_peer_probe and got_ack)) {
++            const t = nowNs();
++            if (t >= deadline) {
++                g.fail("port {d} ({s}) ctrl probe timed out", .{ rl.port, std.mem.sliceTo(&rl.ifname, 0) });
++                return error.ProbeFailed;
++            }
++            if (!got_ack and (t - last_tx) >= 2_000_000) {
++                rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.probe), .seq = 0x50520000 | rl.port });
++                last_tx = t;
++            }
++            if (rl.ctrl_q.peekCtrl()) |rx| {
++                const h = rx.hdr;
++                const ok = rx.valid;
++                rl.ctrl_q.consumeCtrl();
++                if (!ok) continue;
++                if (h.opcode == @intFromEnum(Op.probe)) {
++                    got_peer_probe = true;
++                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.probe_ack), .seq = h.seq });
++                } else if (h.opcode == @intFromEnum(Op.probe_ack)) {
++                    got_ack = true;
++                }
++            }
++        }
++        // 2. 64 KiB (8 packets) bidirectional SPH=1 DDP probe into HOST_NUMA recv[0].
++        const probe_pkts: u32 = 8;
++        const probe_bytes: usize = probe_pkts * max_payload;
++        const send_va = g.region.ptr() + g.layout.sendAt(0);
++        const recv_va = g.region.ptr() + g.layout.recvAt(0);
++        const send_iova = rl.region_iova + g.layout.sendAt(0);
++        const recv_iova = rl.region_iova + g.layout.recvAt(0);
++        const my_tag: u8 = if (g.rank == 0) 0xA5 else 0x5A;
++        const peer_tag: u8 = if (g.rank == 0) 0x5A else 0xA5;
++        for (0..probe_bytes) |i| send_va[i] = my_tag ^ @as(u8, @truncate((i *% 31) >> 3));
++        cacheCleanRange(send_va, probe_bytes);
++        @memset(recv_va[0..probe_bytes], 0xEE);
++        cacheInvalRange(recv_va, probe_bytes);
++
++        rl.data_q.postDdpRx(recv_iova, probe_pkts);
++        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.cts), .seq = 0, .win_start = 0, .win_pkts = probe_pkts, .cts_gen = 1 });
++
++        var peer_cts = false;
++        var tx_sent = false;
++        var peer_ack = false;
++        var rx_got: u32 = 0;
++        var last_cts_tx = nowNs();
++        while (!(rx_got == probe_pkts and peer_ack)) {
++            const t = nowNs();
++            if (t >= deadline) {
++                g.fail("port {d} DDP probe timed out (rx={d}/{d}, cts={}, ack={})", .{ rl.port, rx_got, probe_pkts, peer_cts, peer_ack });
++                return error.ProbeFailed;
++            }
++            if (!tx_sent and !peer_cts and (t - last_cts_tx) >= 2_000_000) {
++                rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.cts), .seq = 0, .win_start = 0, .win_pkts = probe_pkts, .cts_gen = 1 });
++                last_cts_tx = t;
++            }
++            while (rl.ctrl_q.peekCtrl()) |rx| {
++                const h = rx.hdr;
++                const ok = rx.valid;
++                rl.ctrl_q.consumeCtrl();
++                if (!ok) continue;
++                if (h.opcode == @intFromEnum(Op.probe)) {
++                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.probe_ack), .seq = h.seq });
++                } else if (h.opcode == @intFromEnum(Op.cts) and h.seq == 0) {
++                    peer_cts = true;
++                } else if (h.opcode == @intFromEnum(Op.ack) and h.seq == 0) {
++                    peer_ack = true;
++                }
++            }
++            if (peer_cts and !tx_sent) {
++                for (0..probe_pkts) |k| {
++                    const last = (k + 1 == probe_pkts);
++                    rl.data_q.sendGather(
++                        uapi.ethtype_data,
++                        rl.local_mac,
++                        rl.peer_mac,
++                        .{ .opcode = @intFromEnum(Op.bulk_data), .seq = 0, .psn = @intCast(k), .win_pkts = probe_pkts, .cts_gen = 1 },
++                        send_iova + @as(u64, k) * max_payload,
++                        max_payload,
++                        last,
++                    );
++                }
++                tx_sent = true;
++            }
++            while (rl.data_q.pollDataRx()) |comp| {
++                if (comp.err or comp.hdr.opcode != @intFromEnum(Op.bulk_data) or comp.hdr.psn != rx_got or comp.plen != max_payload) {
++                    g.fail("port {d} DDP probe bad pkt (err={} psn={d} want={d} plen={d})", .{ rl.port, comp.err, comp.hdr.psn, rx_got, comp.plen });
++                    return error.ProbeFailed;
++                }
++                rx_got += 1;
++                if (rx_got == probe_pkts) {
++                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.ack), .seq = 0, .win_start = 0, .win_pkts = probe_pkts });
++                }
++            }
++        }
++        cacheInvalRange(recv_va, probe_bytes);
++        for (0..probe_bytes) |i| {
++            const want = peer_tag ^ @as(u8, @truncate((i *% 31) >> 3));
++            if (recv_va[i] != want) {
++                g.fail("port {d} DDP probe payload mismatch at byte {d} (got 0x{x} want 0x{x})", .{ rl.port, i, recv_va[i], want });
++                return error.ProbeFailed;
++            }
++        }
++        if (g.debug) std.log.info("mgbe_zc rank {d} port {d} ({s}): ctrl+DDP probe OK", .{ g.rank, rl.port, std.mem.sliceTo(&rl.ifname, 0) });
++    }
++
++    fn startWorkers(g: *Gather) !void {
++        g.running.store(true, .release);
++        for (0..g.n_ports) |r| {
++            g.rails[r].thread = try std.Thread.spawn(.{}, railWorker, .{ g, r });
++        }
++    }
++
++    /// Poll ctrl_q for incoming control/eager packets, handling both current and lookahead (next-seq) frames.
++    fn drainCtrlRx(g: *Gather, rl: *Rail) void {
++        while (rl.ctrl_q.peekCtrl()) |rx| {
++            const h = rx.hdr;
++            const ok = rx.valid;
++            if (ok) {
++                if (h.seq != 0 and @as(i32, @bitCast(h.seq -% rl.peer_max_seq)) > 0) rl.peer_max_seq = h.seq;
++                switch (h.opcode) {
++                    @intFromEnum(Op.eager) => {
++                        const slot: usize = h.seq & 1;
++                        if ((h.flags & flag_retrans) != 0 and h.seq != 0 and h.seq == rl.eager_tx_hist[slot].seq and
++                            @as(i32, @bitCast(h.seq -% rl.last_seq)) <= 0)
++                        {
++                            // Peer missed our eager frame after we already exited runEager(h.seq); send[slot] is still intact
++                            // (2-slot ping-pong prevents overwriting slot until peer finishes h.seq and h.seq+1).
++                            const th = rl.eager_tx_hist[slot];
++                            g.sendEagerBurst(rl, th.seq, th.nbytes, th.off, th.len, false);
++                            rl.retrans_cnt += 1;
++                        }
++                        const s = &rl.eager_rx[slot];
++                        if (h.seq != s.seq) {
++                            // Only accept packets for seq >= last_seq + 1 (ignore stale retransmits of old seqs).
++                            if (h.seq != 0 and @as(i32, @bitCast(h.seq -% rl.last_seq)) > 0) {
++                                s.* = .{ .seq = h.seq, .mask = 0, .total_pkts = h.total_pkts };
++                            } else {
++                                rl.ctrl_q.consumeCtrl();
++                                continue;
++                            }
++                        }
++                        if (h.total_pkts > 0 and h.psn < 32 and h.psn < h.total_pkts) {
++                            const bit = @as(u32, 1) << @intCast(h.psn);
++                            if ((s.mask & bit) == 0) {
++                                const st = stripeFor(h.nbytes, rl.rail_idx, g.n_ports);
++                                const dst_off = g.layout.recvAt(slot) + st.off + @as(usize, h.psn) * max_payload;
++                                if (dst_off + rx.payload.len <= g.layout.flags) {
++                                    @memcpy(g.region.ptr()[dst_off..][0..rx.payload.len], rx.payload);
++                                }
++                                s.mask |= bit;
++                            }
++                        } else if (h.total_pkts == 0) {
++                            s.mask = 1;
++                        }
++                    },
++                    @intFromEnum(Op.cts) => {
++                        if (!rl.stashed_cts.valid or
++                            @as(i32, @bitCast(h.seq -% rl.stashed_cts.seq)) > 0 or
++                            (h.seq == rl.stashed_cts.seq and (h.win_start > rl.stashed_cts.win_start or
++                                (h.win_start == rl.stashed_cts.win_start and @as(i32, @bitCast(h.cts_gen -% rl.stashed_cts.cts_gen)) >= 0))))
++                        {
++                            rl.stashed_cts = .{ .valid = true, .seq = h.seq, .win_start = h.win_start, .win_pkts = h.win_pkts, .cts_gen = h.cts_gen };
++                        }
++                    },
++                    @intFromEnum(Op.ack) => {
++                        if (!rl.has_stashed_ack or
++                            @as(i32, @bitCast(h.seq -% rl.stashed_ack_seq)) > 0 or
++                            (h.seq == rl.stashed_ack_seq and h.win_start >= rl.stashed_ack_win))
++                        {
++                            rl.stashed_ack_seq = h.seq;
++                            rl.stashed_ack_win = h.win_start;
++                            rl.has_stashed_ack = true;
++                        }
++                    },
++                    @intFromEnum(Op.nack) => {
++                        if (@as(i32, @bitCast(h.seq -% rl.last_seq)) > 0) {
++                            rl.stashed_nack_seq = h.seq;
++                            rl.stashed_nack_win = h.win_start;
++                            rl.stashed_nack_flush = h.win_pkts;
++                            rl.stashed_nack_gen = h.cts_gen;
++                            rl.has_stashed_nack = true;
++                        }
++                    },
++                    else => {},
++                }
++            }
++            rl.ctrl_q.consumeCtrl();
++        }
++    }
++
++    fn signalFlag(g: *Gather, rl: *Rail, slot: usize, seq: u32) void {
++        const flag_off = g.layout.flagAt(slot, rl.rail_idx, g.n_ports);
++        const flag_ptr: *u32 = @ptrCast(@alignCast(g.region.ptr() + flag_off));
++        @atomicStore(u32, flag_ptr, seq, .release);
++        cacheCleanRange(@ptrCast(flag_ptr), 64);
++    }
++
++    fn sendEagerBurst(g: *Gather, rl: *Rail, seq: u32, nbytes: u32, off: usize, len: usize, is_retrans: bool) void {
++        const slot: usize = seq & 1;
++        const send_iova = rl.region_iova + g.layout.sendAt(slot) + off;
++        const npkts: u16 = if (len == 0) 0 else @intCast((len + max_payload - 1) / max_payload);
++        if (npkts == 0) {
++            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                .opcode = @intFromEnum(Op.eager),
++                .flags = if (is_retrans) flag_retrans else 0,
++                .seq = seq,
++                .nbytes = nbytes,
++                .total_pkts = 0,
++            });
++            return;
++        }
++        for (0..npkts) |k| {
++            const po = k * max_payload;
++            const plen: u32 = @intCast(@min(max_payload, len - po));
++            rl.ctrl_q.sendGather(
++                uapi.ethtype_ctrl,
++                rl.local_mac,
++                rl.peer_mac,
++                .{
++                    .opcode = @intFromEnum(Op.eager),
++                    .flags = if (is_retrans and k == 0) flag_retrans else 0,
++                    .seq = seq,
++                    .psn = @intCast(k),
++                    .total_pkts = npkts,
++                    .nbytes = nbytes,
++                },
++                send_iova + po,
++                plen,
++                k + 1 == npkts,
++            );
++        }
++    }
++
++    fn runEager(g: *Gather, rl: *Rail, seq: u32, nbytes: u32, off: usize, len: usize) !void {
++        const slot: usize = seq & 1;
++        const send_va = g.region.ptr() + g.layout.sendAt(slot) + off;
++        const recv_va = g.region.ptr() + g.layout.recvAt(slot) + off;
++        const total_pkts: u16 = if (len == 0) 0 else @intCast((len + max_payload - 1) / max_payload);
++        const want_mask: u32 = if (total_pkts == 0) 1 else (@as(u32, 1) << @intCast(total_pkts)) - 1;
++
++        if (len > 0) cacheCleanRange(send_va, len);
++        rl.eager_tx_hist[slot] = .{ .seq = seq, .nbytes = nbytes, .off = off, .len = len };
++        g.sendEagerBurst(rl, seq, nbytes, off, len, false);
++        const t0 = nowNs();
++        var last_tx = t0;
++        while (g.running.load(.monotonic)) {
++            g.drainCtrlRx(rl);
++            const es = &rl.eager_rx[slot];
++            if (es.seq == seq and es.mask == want_mask) {
++                if (len > 0) cacheCleanRange(recv_va, len);
++                g.signalFlag(rl, slot, seq);
++                rl.eager_cnt += 1;
++                return;
++            }
++            const t = nowNs();
++            if (t - last_tx >= 500_000) {
++                g.sendEagerBurst(rl, seq, nbytes, off, len, true);
++                rl.retrans_cnt += 1;
++                last_tx = t;
++            }
++            if (t - t0 >= g.timeout_ns) {
++                g.fail("port {d} eager seq {d} ({d} B) timed out (got_seq={d} mask=0x{x}/0x{x})", .{ rl.port, seq, len, es.seq, es.mask, want_mask });
++                return error.ProxyFailed;
++            }
++        }
++        return error.ProxyFailed;
++    }
++
++    fn runDdp(g: *Gather, rl: *Rail, seq: u32, nbytes: u32, off: usize, len: usize) !void {
++        const slot: usize = seq & 1;
++        const send_va = g.region.ptr() + g.layout.sendAt(slot) + off;
++        const send_iova = rl.region_iova + g.layout.sendAt(slot) + off;
++        const recv_va = g.region.ptr() + g.layout.recvAt(slot) + off;
++        const recv_iova = rl.region_iova + g.layout.recvAt(slot) + off;
++        const total_pkts: u32 = @intCast((len + max_payload - 1) / max_payload);
++
++        cacheCleanRange(send_va, len);
++        cacheInvalRange(recv_va, len);
++
++        var win_start: u32 = 0;
++        var cts_gen: u32 = 1;
++        while (win_start < total_pkts) {
++            const win_pkts: u32 = @min(bulk_win_max_pkts, total_pkts - win_start);
++            const win_off = @as(u64, win_start) * max_payload;
++            // Post our DDP RX window and immediately advertise CTS to peer.
++            rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
++            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                .opcode = @intFromEnum(Op.cts),
++                .seq = seq,
++                .win_start = win_start,
++                .win_pkts = @intCast(win_pkts),
++                .nbytes = nbytes,
++                .cts_gen = cts_gen,
++            });
++
++            var tx_allowed = false;
++            var tx_sent: u32 = 0;
++            var tx_flush: u32 = 0;
++            var tx_acked = false;
++            var rx_got: u32 = 0;
++            var rx_skip: u32 = 0;
++            var rx_gap = false;
++            var rx_acked = false;
++            var peer_cts_gen: u32 = 0;
++            const t_win = nowNs();
++            var last_cts_tx = t_win;
++            var last_ack_tx: u64 = 0;
++            var last_rx_activity = t_win;
++
++            while (!(rx_acked and tx_acked)) {
++                if (!g.running.load(.monotonic)) return error.ProxyFailed;
++                g.drainCtrlRx(rl);
++
++                // Consume stashed CTS for this (seq, win_start)
++                if (rl.stashed_cts.valid and rl.stashed_cts.seq == seq and rl.stashed_cts.win_start == win_start) {
++                    if (!tx_allowed or rl.stashed_cts.cts_gen != peer_cts_gen) {
++                        peer_cts_gen = rl.stashed_cts.cts_gen;
++                        tx_allowed = true;
++                        tx_sent = 0;
++                        tx_flush = 0;
++                    }
++                    rl.stashed_cts.valid = false;
++                }
++                if (rl.has_stashed_ack and rl.stashed_ack_seq == seq and rl.stashed_ack_win == win_start) {
++                    tx_acked = true;
++                    rl.has_stashed_ack = false;
++                }
++                if (rl.has_stashed_nack and rl.stashed_nack_seq == seq and rl.stashed_nack_win == win_start) {
++                    if (rl.stashed_nack_gen != peer_cts_gen) {
++                        // Peer posted fresh DDP RX window after `stashed_nack_flush` leftover descriptors:
++                        // emit `tx_flush` short dummy frames to consume those leftovers, then resend the full window.
++                        peer_cts_gen = rl.stashed_nack_gen;
++                        tx_flush = rl.stashed_nack_flush;
++                        tx_sent = 0;
++                        tx_allowed = true;
++                        rl.retrans_cnt += 1;
++                    }
++                    rl.has_stashed_nack = false;
++                }
++                if (!tx_acked and (@as(i32, @bitCast(rl.peer_max_seq -% seq)) > 0 or
++                    (rl.stashed_cts.valid and rl.stashed_cts.seq == seq and rl.stashed_cts.win_start > win_start)))
++                {
++                    tx_acked = true;
++                }
++
++                // Stream TX batch while allowed (never transmit into an unposted peer RX ring).
++                if (tx_allowed and !tx_acked and (tx_flush > 0 or tx_sent < win_pkts)) {
++                    var sent_now: u32 = 0;
++                    while (tx_flush > 0 and sent_now < tx_batch_pkts) {
++                        const ring_db = (sent_now + 1 == tx_batch_pkts) or (tx_flush == 1 and tx_sent == win_pkts);
++                        rl.data_q.sendGather(
++                            uapi.ethtype_data,
++                            rl.local_mac,
++                            rl.peer_mac,
++                            .{
++                                .opcode = @intFromEnum(Op.bulk_data),
++                                .seq = seq,
++                                .win_start = win_start,
++                                .psn = 0xFFFFFFFF,
++                                .win_pkts = @intCast(win_pkts),
++                                .nbytes = nbytes,
++                                .cts_gen = peer_cts_gen,
++                            },
++                            send_iova,
++                            16,
++                            ring_db,
++                        );
++                        tx_flush -= 1;
++                        sent_now += 1;
++                    }
++                    while (tx_flush == 0 and tx_sent < win_pkts and sent_now < tx_batch_pkts) {
++                        const global_p = win_start + tx_sent;
++                        const po = @as(usize, global_p) * max_payload;
++                        const plen: u32 = @intCast(@min(max_payload, len - po));
++                        const ring_db = (sent_now + 1 == tx_batch_pkts) or (tx_sent + 1 == win_pkts);
++                        rl.data_q.sendGather(
++                            uapi.ethtype_data,
++                            rl.local_mac,
++                            rl.peer_mac,
++                            .{
++                                .opcode = @intFromEnum(Op.bulk_data),
++                                .seq = seq,
++                                .win_start = win_start,
++                                .psn = tx_sent,
++                                .win_pkts = @intCast(win_pkts),
++                                .nbytes = nbytes,
++                                .cts_gen = peer_cts_gen,
++                            },
++                            send_iova + po,
++                            plen,
++                            ring_db,
++                        );
++                        tx_sent += 1;
++                        sent_now += 1;
++                    }
++                }
++
++                // Poll RX DDP completions
++                var drained_any = false;
++                while (!rx_acked and (rx_skip > 0 or rx_got < win_pkts)) {
++                    const comp = rl.data_q.pollDataRx() orelse break;
++                    drained_any = true;
++                    last_rx_activity = nowNs();
++                    if (rx_skip > 0) {
++                        rx_skip -= 1;
++                        continue;
++                    }
++                    if (comp.err or comp.hdr.seq != seq or comp.hdr.win_start != win_start or comp.hdr.psn != rx_got) {
++                        rx_gap = true;
++                    }
++                    rx_got += 1;
++                }
++                if (!rx_acked and rx_skip == 0 and rx_got == win_pkts) {
++                    if (!rx_gap) {
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.ack),
++                            .seq = seq,
++                            .win_start = win_start,
++                            .win_pkts = @intCast(win_pkts),
++                        });
++                        rx_acked = true;
++                        last_ack_tx = nowNs();
++                    } else {
++                        // Clean Go-Back-N recovery: 0 leftover descriptors, post fresh window and request resend.
++                        rx_got = 0;
++                        rx_gap = false;
++                        cts_gen +%= 1;
++                        rl.retrans_cnt += 1;
++                        rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.nack),
++                            .seq = seq,
++                            .win_start = win_start,
++                            .win_pkts = 0,
++                            .cts_gen = cts_gen,
++                        });
++                        last_rx_activity = nowNs();
++                    }
++                }
++
++                const t = nowNs();
++                if (rx_acked and !tx_acked and (t - last_ack_tx) >= 2_000_000) {
++                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                        .opcode = @intFromEnum(Op.ack),
++                        .seq = seq,
++                        .win_start = win_start,
++                        .win_pkts = @intCast(win_pkts),
++                    });
++                    last_ack_tx = t;
++                }
++                // Re-send our CTS while peer hasn't delivered any packet for our RX window yet (independent of tx_allowed!).
++                if (!rx_acked and rx_skip == 0 and rx_got == 0 and (t - last_cts_tx) >= 1_000_000) {
++                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                        .opcode = @intFromEnum(Op.cts),
++                        .seq = seq,
++                        .win_start = win_start,
++                        .win_pkts = @intCast(win_pkts),
++                        .nbytes = nbytes,
++                        .cts_gen = cts_gen,
++                    });
++                    last_cts_tx = t;
++                }
++                // Partial RX window stalled (a packet dropped on the wire): post a fresh aligned window behind the
++                // `rem` leftover descriptors and ask peer to flush `rem` short frames then resend the window.
++                if (!rx_acked and (rx_skip > 0 or (rx_got > 0 and rx_got < win_pkts)) and !drained_any and (t - last_rx_activity) >= 5_000_000) {
++                    const rem: u32 = rx_skip + (win_pkts - rx_got);
++                    if (rl.data_q.rx_prod -% rl.data_q.rx_cons + win_pkts < uapi.ring_desc_cnt - 16) {
++                        rx_skip = rem;
++                        rx_got = 0;
++                        rx_gap = false;
++                        cts_gen +%= 1;
++                        rl.retrans_cnt += 1;
++                        rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.nack),
++                            .seq = seq,
++                            .win_start = win_start,
++                            .win_pkts = @intCast(rem),
++                            .cts_gen = cts_gen,
++                        });
++                    }
++                    last_rx_activity = t;
++                }
++                if (t - t_win >= g.timeout_ns) {
++                    g.fail("port {d} DDP seq {d} win {d} timed out (rx={d}/{d} skip={d} ack_rx={} tx={d}/{d} ack_tx={})", .{ rl.port, seq, win_start, rx_got, win_pkts, rx_skip, rx_acked, tx_sent, win_pkts, tx_acked });
++                    return error.ProxyFailed;
++                }
++            }
++            win_start += win_pkts;
++            cts_gen +%= 1;
++        }
++        cacheInvalRange(recv_va, len);
++        g.signalFlag(rl, slot, seq);
++        rl.ddp_cnt += 1;
++    }
++
++    fn railWorker(g: *Gather, rail_idx: usize) void {
++        const rl = &g.rails[rail_idx];
++        if (rl.pin_cpu >= 0) pinCpu(rl.pin_cpu);
++        const c = g.ctrl();
++        var idle: u64 = 0;
++        while (g.running.load(.monotonic)) {
++            g.drainCtrlRx(rl);
++            const seq = @atomicLoad(u32, &c[c_seq], .acquire);
++            if (seq == rl.last_seq) {
++                idle += 1;
++                if (idle % 64 == 0) {
++                    rl.ctrl_q.reclaimTx();
++                    rl.data_q.reclaimTx();
++                }
++                if (idle >= idle_spins) nap.pause();
++                continue;
++            }
++            idle = 0;
++            var pending = seq -% rl.last_seq;
++            if (pending > slots) {
++                g.fail("port {d}: doorbell skipped {d} sequences (last {d}, now {d})", .{ rl.port, pending, rl.last_seq, seq });
++                @atomicStore(u32, &c[c_error], seq, .release);
++                g.failed.store(true, .release);
++                return;
++            }
++            var s = rl.last_seq +% 1;
++            while (pending > 0) : ({
++                s +%= 1;
++                pending -= 1;
++            }) {
++                const nbytes = @atomicLoad(u32, &c[c_nbytes + (s & 1)], .acquire);
++                if (nbytes == 0 or nbytes % 16 != 0 or nbytes > g.layout.slot_bytes) {
++                    g.fail("port {d}: bad shard size {d} at seq {d}", .{ rl.port, nbytes, s });
++                    @atomicStore(u32, &c[c_error], s, .release);
++                    g.failed.store(true, .release);
++                    return;
++                }
++                const st = stripeFor(nbytes, rail_idx, g.n_ports);
++                const res = if (st.len <= g.eager_max)
++                    g.runEager(rl, s, nbytes, st.off, st.len)
++                else
++                    g.runDdp(rl, s, nbytes, st.off, st.len);
++                res catch {
++                    @atomicStore(u32, &c[c_hca], rl.port, .release);
++                    @atomicStore(u32, &c[c_error], s, .release);
++                    g.failed.store(true, .release);
++                    return;
++                };
++                rl.last_seq = s;
++            }
++        }
++    }
++
++    pub fn fits(g: *const Gather, bytes: usize) bool {
++        return bytes > 0 and bytes <= g.max_bytes and bytes % 16 == 0;
++    }
++
++    /// Launches kernels.roce_gather on `stream` (CUDA-Graph capturable).
++    pub fn gather(g: *Gather, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize) !void {
++        if (send % 16 != 0 or recv % 16 != 0) return error.Misaligned;
++        const packs = bytes / 16;
++        const need = @max(1, std.math.divCeil(usize, packs, 2 * threads) catch unreachable);
++        const grid: u32 = @intCast(@min(std.math.ceilPowerOfTwo(usize, need) catch max_blocks, max_blocks));
++        const klass: i32 = @intCast(std.math.log2_int(u32, grid));
++        const base: abi.DevicePtr = g.region.va;
++        var a: launch.Args = .{};
++        a.add(send);
++        a.add(recv);
++        a.add(@as(i32, @intCast(packs)));
++        a.add(@as(i32, g.rank));
++        a.add(base + g.layout.recv);
++        a.add(base + g.layout.flags);
++        a.add(base + g.layout.send);
++        a.add(base + g.layout.ctrl);
++        a.add(@as(i64, @intCast(g.layout.slot_bytes)));
++        a.add(g.counters.ptr);
++        a.add(klass);
++        a.add(spin_limit);
++        a.add(@as(i32, @intCast(g.n_ports)));
++        a.add(@as(i32, 2));
++        try launch.launch(g.f, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = g.d }, &a);
++        g.gathers += 1;
++    }
++
++    pub fn check(g: *Gather) !void {
++        const c = g.ctrl();
++        const bad = @atomicLoad(u32, &c[c_error], .acquire);
++        if (bad == 0 and !g.failed.load(.acquire)) return;
++        std.log.err("mgbe_zc all-gather failed (seq {d}, port {d}): {s}", .{ bad, c[c_hca], std.mem.sliceTo(&g.err, 0) });
++        return error.ProxyFailed;
++    }
++
++    pub fn abort(g: *Gather) void {
++        g.running.store(false, .release);
++    }
++
++    fn teardownRails(g: *Gather) void {
++        for (0..g.n_ports) |r| {
++            const rl = &g.rails[r];
++            rl.data_q.teardown(g.fd);
++            rl.ctrl_q.teardown(g.fd);
++            if (rl.pool_mr_id != 0 and g.fd >= 0) {
++                _ = std.os.linux.ioctl(g.fd, uapi.ioc_dereg_mr, @intFromPtr(&rl.pool_mr_id));
++                rl.pool_mr_id = 0;
++            }
++            if (rl.pool_va) |p| {
++                munmapPtr(p, port_pool_bytes);
++                rl.pool_va = null;
++            }
++        }
++    }
++
++    fn teardown(g: *Gather) void {
++        if (g.running.swap(false, .acq_rel)) {
++            for (0..g.n_ports) |r| {
++                if (g.rails[r].thread) |t| t.join();
++                g.rails[r].thread = null;
++            }
++        }
++        if (g.debug and g.gathers > 0) {
++            std.log.info("mgbe_zc rank {d}: {d} gathers (rail0 eager={d} ddp={d} retrans={d})", .{
++                g.rank, g.gathers, g.rails[0].eager_cnt, g.rails[0].ddp_cnt, g.rails[0].retrans_cnt,
++            });
++        }
++        g.teardownRails();
++        g.module.unload();
++        g.counters.free();
++        if (g.region_mr_id != 0 and g.fd >= 0) {
++            _ = std.os.linux.ioctl(g.fd, uapi.ioc_dereg_mr, @intFromPtr(&g.region_mr_id));
++            g.region_mr_id = 0;
++        }
++        g.region.free();
++        if (g.fd >= 0) {
++            _ = std.os.linux.close(g.fd);
++            g.fd = -1;
++        }
++    }
++
++    pub fn deinit(g: *Gather) void {
++        g.teardown();
++        g.gpa.destroy(g);
++    }
++};
++
++test "mgbe_zc layout and striping cover every byte without overlap" {
++    const l = Layout.of(16 << 20);
++    try std.testing.expectEqual(@as(usize, 0), l.recv);
++    try std.testing.expectEqual(@as(usize, 32 << 20), l.flags);
++    try std.testing.expectEqual(l.flags + 2 * 4 * 128, l.send);
++    try std.testing.expectEqual(l.send + (32 << 20), l.ctrl);
++    for ([_]usize{ 16, 48, 64, 4096, 32768, 131072, (16 << 20) - 16, 16 << 20 }) |nb| {
++        var total: usize = 0;
++        for (0..4) |r| {
++            const st = stripeFor(nb, r, 4);
++            try std.testing.expectEqual(total, st.off);
++            try std.testing.expectEqual(@as(usize, 0), st.len % 16);
++            total += st.len;
++        }
++        try std.testing.expectEqual(nb, total);
++    }
++}
+diff --git a/zig/src/cuda/mgbe_zc_uapi.zig b/zig/src/cuda/mgbe_zc_uapi.zig
+new file mode 100644
+index 000000000..34c6c409b
+--- /dev/null
++++ b/zig/src/cuda/mgbe_zc_uapi.zig
+@@ -0,0 +1,111 @@
++//! Userspace ABI for /dev/mgbe_zc (Tegra264 zero-copy 4x25GbE MGBE driver), matching mgbe_zc_uapi.h.
++const std = @import("std");
++
++pub const dev_path: [:0]const u8 = "/dev/mgbe_zc";
++
++pub const max_ports: usize = 4;
++pub const queues_per_port: usize = 2; // qidx 0: VDMA 2 (ctrl/eager), qidx 1: VDMA 3 (DDP data)
++pub const ring_desc_cnt: u32 = 4096;
++pub const ring_mask: u32 = ring_desc_cnt - 1;
++pub const ring_bytes: usize = @as(usize, ring_desc_cnt) * 16; // 64 KiB
++pub const reg_map_bytes: usize = 4096;
++
++pub const ethtype_ctrl: u16 = 0x88B5; // FRP entry 0 -> VDMA 2 (qidx 0)
++pub const ethtype_data: u16 = 0x88B6; // FRP entry 1 -> VDMA 3 (qidx 1)
++
++pub const ch_tdtlp: usize = 0x24; // TX tail pointer doorbell
++pub const ch_rdtlp: usize = 0x2C; // RX tail pointer doorbell
++
++pub const desc_own: u32 = 1 << 31;
++pub const desc_ctxt: u32 = 1 << 30;
++pub const desc_fd: u32 = 1 << 29;
++pub const desc_ld: u32 = 1 << 28;
++
++pub const rdes3_es_mgbe: u32 = 1 << 15;
++pub const rdes3_pl_mask: u32 = 0x00003FFF;
++
++pub const tdes2_b1l_mask: u32 = 0x00003FFF;
++pub const tdes3_fl_mask: u32 = 0x00007FFF;
++
++pub const HwDesc = extern struct {
++    d0: u32,
++    d1: u32,
++    d2: u32,
++    d3: u32,
++};
++
++pub const PortInfo = extern struct {
++    port: u32 = 0,
++    present: u32 = 0,
++    ifname: [16]u8 = @splat(0),
++    mac: [6]u8 = @splat(0),
++    pad0: [2]u8 = @splat(0),
++    link_up: u32 = 0,
++    mtu: u32 = 0,
++    sph_supported: u32 = 0,
++    hw_chan: [queues_per_port]u32 = @splat(0),
++    pdma_chan: [queues_per_port]u32 = @splat(0),
++    reg_page_off: u32 = 0,
++    ring_desc_cnt: u32 = 0,
++};
++
++pub const QueueAlloc = extern struct {
++    port: u32 = 0,
++    qidx: u32 = 0,
++    tx_ring_iova: u64 = 0,
++    rx_ring_iova: u64 = 0,
++    mmap_tx_off: u64 = 0,
++    mmap_rx_off: u64 = 0,
++    mmap_reg_off: u64 = 0,
++    ch_reg_off: u32 = 0,
++    hw_chan: u32 = 0,
++};
++
++pub const QueueStart = extern struct {
++    port: u32 = 0,
++    qidx: u32 = 0,
++    rx_buf_size: u32 = 0,
++    sph_enable: u32 = 0,
++    sph_split_bytes: u32 = 0,
++    init_rx_tail_idx: u32 = 0,
++    cur_tx_desc_lo: u32 = 0,
++    cur_rx_desc_lo: u32 = 0,
++};
++
++pub const QueueStop = extern struct {
++    port: u32 = 0,
++    qidx: u32 = 0,
++};
++
++pub const MrReq = extern struct {
++    va: u64 = 0,
++    len: u64 = 0,
++    dmabuf_fd: i32 = -1,
++    flags: u32 = 0,
++    mr_id: u32 = 0,
++    nents: [max_ports]u32 = @splat(0),
++    iova: [max_ports]u64 = @splat(0),
++    first_seg_len: [max_ports]u64 = @splat(0),
++};
++
++fn iowr(comptime nr: u8, comptime T: type) u32 {
++    return (@as(u32, 3) << 30) | (@as(u32, @sizeOf(T)) << 16) | (@as(u32, 'Z') << 8) | @as(u32, nr);
++}
++
++pub const ioc_port_info: u32 = iowr(1, PortInfo);
++pub const ioc_queue_alloc: u32 = iowr(2, QueueAlloc);
++pub const ioc_queue_start: u32 = iowr(3, QueueStart);
++pub const ioc_queue_stop: u32 = iowr(4, QueueStop);
++pub const ioc_reg_mr: u32 = iowr(5, MrReq);
++pub const ioc_dereg_mr: u32 = iowr(6, u32);
++pub const ioc_port_reinit: u32 = iowr(7, u32);
++
++comptime {
++    std.debug.assert(@sizeOf(HwDesc) == 16);
++    std.debug.assert(@sizeOf(PortInfo) == 68);
++    std.debug.assert(@sizeOf(QueueAlloc) == 56);
++    std.debug.assert(@sizeOf(QueueStart) == 32);
++    std.debug.assert(@sizeOf(QueueStop) == 8);
++    std.debug.assert(@sizeOf(MrReq) == 112);
++    std.debug.assert(@offsetOf(MrReq, "iova") == 48);
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index b6476817f..ae6ffa602 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -31,6 +31,8 @@ pub const graph = @import("graph.zig");
+ pub const cublaslt = @import("cublaslt.zig");
+ pub const nccl = @import("nccl.zig");
+ pub const roce = @import("roce.zig");
++pub const mgbe_zc = @import("mgbe_zc.zig");
++pub const mgbe_zc_uapi = @import("mgbe_zc_uapi.zig");
+ pub const triton = @import("triton.zig");
+ pub const aot = @import("aot.zig");
+ pub const kernels = @import("kernels.zig");
+@@ -118,6 +120,8 @@ test {
+     _ = @import("sample.zig");
+     _ = @import("roce.zig");
+     _ = @import("roce_nap.zig");
++    _ = mgbe_zc;
++    _ = mgbe_zc_uapi;
+     _ = @import("rank_scatter.zig");
+     _ = @import("relay_plan.zig");
+     _ = launch;
+diff --git a/zig/src/cuda/tp_group.zig b/zig/src/cuda/tp_group.zig
+index 147b046ee..b588fa017 100644
+--- a/zig/src/cuda/tp_group.zig
++++ b/zig/src/cuda/tp_group.zig
+@@ -5,6 +5,7 @@ const driver = @import("driver.zig");
+ const stream_ = @import("stream.zig");
+ const memory = @import("memory.zig");
+ const roce = @import("roce.zig");
++const mgbe_zc = @import("mgbe_zc.zig");
+ const p2p_report = @import("p2p_report.zig");
+ const abi = @import("abi.zig");
+ 
+@@ -27,6 +28,7 @@ pub const Group = struct {
+     world: usize,
+     aborted: std.atomic.Value(bool) = .init(false),
+     fast: ?*roce.Gather = null, // the ranks' small all-gathers by RoCE writes (openRoce), when every rank brought it up
++    zc: ?*mgbe_zc.Gather = null, // two-rank /dev/mgbe_zc 4x25GbE zero-copy all-gather (openMgbeZc) on Jetson Thor
+     multi: ?Multi = null, // three ranks or more: small all-gathers on a borrowed wire, set once every rank's probe agreed
+ 
+     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
+@@ -53,10 +55,12 @@ pub const Group = struct {
+         g.* = undefined;
+     }
+ 
+-    /// The RoCE wires beside NCCL: two ranks' gathers, or a borrowed one.
++    /// The RoCE and mgbe_zc wires beside NCCL: two ranks' gathers, or a borrowed one.
+     fn closeWires(g: *Group) void {
+         if (g.fast) |f| f.deinit();
+         g.fast = null;
++        if (g.zc) |z| z.deinit();
++        g.zc = null;
+         if (g.multi) |m| m.deinit(m.ctx);
+         g.multi = null;
+     }
+@@ -67,6 +71,7 @@ pub const Group = struct {
+     }
+ 
+     pub fn abort(g: *Group) void {
++        if (g.zc) |z| z.abort();
+         if (g.multi) |m| m.abort(m.ctx);
+         if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
+     }
+@@ -81,15 +86,23 @@ pub const Group = struct {
+         g.fast = try roce.Gather.init(gpa, io, d, g, s, roce.wanted(g.world), max_bytes);
+     }
+ 
+-    /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
++    /// Two-rank gathers up to `max_bytes` go over /dev/mgbe_zc (4x25GbE zero-copy) when both ranks open and pass probe.
++    pub fn openMgbeZc(g: *Group, gpa: std.mem.Allocator, d: *const driver.Driver, s: Stream, max_bytes: usize) !void {
++        if (g.world != 2 or g.fast != null or g.zc != null) return;
++        g.zc = try mgbe_zc.Gather.init(gpa, d, g, s, mgbe_zc.wanted(g.world), max_bytes);
++    }
++
++    /// A failed RoCE/mgbe_zc gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
+     pub fn check(g: *const Group) !void {
+         if (g.fast) |f| try f.check();
++        if (g.zc) |z| try z.check();
+         if (g.multi) |m| try m.check(m.ctx);
+     }
+ 
+     /// `bytes` at `mine` from every rank into `all` in rank order (world * bytes there), on `s`.
+     pub fn allGather(g: *const Group, s: Stream, mine: u64, all: u64, bytes: usize) !void {
+         if (g.fast) |f| if (f.fits(bytes)) return f.gather(s.handle, mine, all, bytes);
++        if (g.zc) |z| if (z.fits(bytes)) return z.gather(s.handle, mine, all, bytes);
+         if (g.multi) |m| if (m.fits(m.ctx, bytes)) return m.gather(m.ctx, s.handle, mine, all, bytes);
+         try g.call(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, s.handle), "ncclAllGather");
+     }
+diff --git a/zig/src/cuda/tp_watch.zig b/zig/src/cuda/tp_watch.zig
+index 9f55dc15a..2540f19fa 100644
+--- a/zig/src/cuda/tp_watch.zig
++++ b/zig/src/cuda/tp_watch.zig
+@@ -55,14 +55,14 @@ pub fn explain(e: anyerror) ?[]const u8 {
+     };
+ }
+ 
+-/// A stream socket whose peer's host vanishing (no FIN) shows within about 20 s: 10 s idle, then 3 probes 3 s apart.
++/// A stream socket whose peer's host vanishing (no FIN) shows within about 60 s: 30 s idle, then 6 probes 5 s apart.
+ fn socket() !posix.socket_t {
+     const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+     if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
+     const fd: posix.socket_t = @intCast(rc);
+     const one: c_int = 1;
+     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&one)) catch {};
+-    if (@import("builtin").os.tag == .linux) for ([_][2]u32{ .{ posix.TCP.KEEPIDLE, 10 }, .{ posix.TCP.KEEPINTVL, 3 }, .{ posix.TCP.KEEPCNT, 3 } }) |o| {
++    if (@import("builtin").os.tag == .linux) for ([_][2]u32{ .{ posix.TCP.KEEPIDLE, 30 }, .{ posix.TCP.KEEPINTVL, 5 }, .{ posix.TCP.KEEPCNT, 6 } }) |o| {
+         const v: c_int = @intCast(o[1]);
+         posix.setsockopt(fd, posix.IPPROTO.TCP, o[0], std.mem.asBytes(&v)) catch {};
+     };
+@@ -224,17 +224,22 @@ pub fn stop() noreturn {
+ /// A line's records; it closing or carrying an error stops this rank unless it ends on purpose.
+ fn watch(fd: posix.socket_t, line: usize) void {
+     var r: Record = undefined;
++    var last_err: posix.E = .SUCCESS;
+     while (true) {
+         const b = std.mem.asBytes(&r);
+         var at: usize = 0;
+         while (at < b.len) {
+             const rc = posix.system.read(fd, b[at..].ptr, b.len - at);
+-            switch (posix.errno(rc)) {
++            const e = posix.errno(rc);
++            switch (e) {
+                 .SUCCESS => if (rc == 0) break else {
+                     at += @intCast(rc);
+                 },
+                 .INTR => {},
+-                else => break,
++                else => {
++                    last_err = e;
++                    break;
++                },
+             }
+         }
+         if (at < b.len) break;
+@@ -260,6 +265,7 @@ fn watch(fd: posix.socket_t, line: usize) void {
+         }
+     }
+     if (ending.load(.acquire)) return;
++    if (last_err != .SUCCESS) std.log.err("rank {d}: liveness line read error ({s})", .{ my_rank, @tagName(last_err) });
+     std.log.err("rank {d}: another rank's process ended (its line closed); this rank stops instead of waiting on it", .{my_rank});
+     stop();
+ }
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 4c430e012..6c2522c5e 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -288,11 +288,15 @@ pub const Engine = struct {
+     pub fn installGroup(e: *Engine, g: *cuda.tp_group.Group) void {
+         e.group = g;
+         e.backend.group = g;
+-        std.log.info("[tensorfold] glm: rank {d} of {d} sums through the {t} collective (RoCE gathers {s})", .{ g.rank, g.world, e.collective.kind(), if (g.fast != null or g.multi != null) "on" else "off" });
++        if (g.zc) |z| {
++            std.log.info("[tensorfold] glm: rank {d} of {d} sums through the {t} collective (mgbe_zc gathers on: {d} rail(s), up to {d} KiB)", .{ g.rank, g.world, e.collective.kind(), z.n_ports, z.max_bytes >> 10 });
++        } else {
++            std.log.info("[tensorfold] glm: rank {d} of {d} sums through the {t} collective (RoCE gathers {s})", .{ g.rank, g.world, e.collective.kind(), if (g.fast != null or g.multi != null) "on" else "off" });
++        }
+     }
+ 
+     pub fn exchange(e: *const Engine) fw.Exchange {
+-        return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .collective = e.collective } };
++        return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .collective = e.collective, .group = e.group } };
+     }
+ 
+     pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 5a6f0247d..62c065a6e 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -125,8 +125,8 @@ pub const Pieces = pieces_mod.Pieces;
+ /// How the ranks' partials meet: every rank in-process copying into the others' slots, or one rank over NCCL.
+ pub const Exchange = union(enum) {
+     local,
+-    // collective: the boundary's gathers through it (the group's RoCE route once installed); side streams stay raw
+-    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, collective: ?@import("tp").Collective = null },
++    // collective: the boundary's gathers through it (the group's RoCE/mgbe_zc route once installed); side streams take mgbe_zc when present
++    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, collective: ?@import("tp").Collective = null, group: ?*const cuda.tp_group.Group = null },
+ };
+ 
+ /// One rank of the forward: its weights, its sequence's caches, the window's buffers.
+diff --git a/zig/src/families/glm/cuda_forward_pieces.zig b/zig/src/families/glm/cuda_forward_pieces.zig
+index c713c513f..04e99f19c 100644
+--- a/zig/src/families/glm/cuda_forward_pieces.zig
++++ b/zig/src/families/glm/cuda_forward_pieces.zig
+@@ -181,6 +181,7 @@ pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split:
+         },
+         .nccl => |x| {
+             const r = f.ranks[0];
++            if (x.group) |g| if (g.zc) |z| if (z.fits(bytes)) return z.gather(p.side.handle, room(r, lo) + r.w.share.rank * bytes, room(r, lo), bytes);
+             try x.lib.check(x.lib.api.ncclAllGather(room(r, lo) + r.w.share.rank * bytes, room(r, lo), n * D, .f32, x.comm, p.side.handle), "ncclAllGather");
+         },
+     } else switch (f.exchange) {
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index b8eada986..e00e109e1 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -333,6 +333,9 @@ fn finishRank(a: OpenArgs) !Loaded {
+     // the group's own RoCE path (every rank or none), unless TF_GLM_ROCE_MULTI=1 lends fabric/tp's wire
+     if (ranks.ownRoce(set, p.world)) try own.group.openRoce(gpa, io, ctx.d, own.e.stream, roce_bytes);
+     errdefer if (own.group.fast) |f| f.deinit();
++    // On two-rank Thor without RDMA verbs, open /dev/mgbe_zc 4x25GbE zero-copy all-gather (both ranks or neither).
++    if (p.world == 2 and own.group.fast == null) try own.group.openMgbeZc(gpa, ctx.d, own.e.stream, cuda.mgbe_zc.maxBytesFromEnv());
++    errdefer if (own.group.zc) |z| z.deinit();
+     try @import("cuda_roce_multi.zig").open(gpa, io, ctx.d, &own.group, set.roce_multi); // three ranks or more, likewise
+     errdefer if (own.group.multi) |m| m.deinit(m.ctx);
+     own.e.installGroup(&own.group);
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 8f7bf72a1..2d6ee6524 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -12,6 +12,7 @@ const oracle_tests = @import("oracle_tests.zig");
+ const libs_tests = @import("libs_tests.zig");
+ const rank_scatter_tests = @import("rank_scatter_tests.zig");
+ const roce_gather_tests = @import("roce_gather_tests.zig");
++const mgbe_zc_gather_tests = @import("mgbe_zc_gather_tests.zig");
+ const sample_tests = @import("sample_tests.zig");
+ const glue_tests = @import("glue_tests.zig");
+ const resume_tests = @import("resume_tests.zig");
+@@ -228,6 +229,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+         return rank_scatter_tests.run(gpu, rank, world, if (rest.len > 2) rest[2] else null);
+     }
+     if (std.mem.eql(u8, cmd, "roce-gather")) return roce_gather_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10), if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 2);
++    if (std.mem.eql(u8, cmd, "mgbe-zc-gather")) return mgbe_zc_gather_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
+     if (std.mem.eql(u8, cmd, "rank-sum")) return rank_scatter_tests.sum(gpu);
+     if (std.mem.eql(u8, cmd, "nccl-pair")) return libs_tests.ncclPair(gpu, try std.fmt.parseInt(c_int, try arg(rest, 0), 10), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try arg(rest, 2));
+     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
+diff --git a/zig/tests/cuda/mgbe_zc_gather_tests.zig b/zig/tests/cuda/mgbe_zc_gather_tests.zig
+new file mode 100644
+index 000000000..8cf839934
+--- /dev/null
++++ b/zig/tests/cuda/mgbe_zc_gather_tests.zig
+@@ -0,0 +1,178 @@
++//! Two-rank /dev/mgbe_zc zero-copy all-gather against NCCL byte-for-byte: `tf-cuda-test mgbe-zc-gather <rank>`.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const Gpu = check.Gpu;
++
++const cap: usize = 16 << 20;
++const sizes = [_]usize{
++    64,
++    4096,
++    8192,
++    16384,
++    32768,
++    65536,
++    131072,
++    131072 + 128, // triggers DDP with trailing short SPH=1 packet
++    262144,
++    524288 + 4096, // DDP with short tail across 4 rails
++    1 << 20,
++    4 << 20,
++    8 << 20,
++    cap,
++};
++const graph_gathers = 4;
++const graph_replays = 32;
++
++fn shard(out: []u8, seed: u64, rank: usize) void {
++    var rng = std.Random.DefaultPrng.init(seed *% 1000003 +% rank *% 7919 +% out.len);
++    rng.random().bytes(out);
++}
++
++fn expected(want: []u8, n: usize, seed: u64) void {
++    for (0..2) |r| shard(want[r * n ..][0..n], seed, r);
++}
++
++pub fn run(gpu: Gpu, rank: usize) !void {
++    const a = gpu.gpa;
++    try check.expect(std.c.getenv("NCCL_COMM_ID") != null, "mgbe-zc-gather: NCCL_COMM_ID must name rank 0", .{});
++    try check.expect(rank < 2, "mgbe-zc-gather: rank {d} must be 0 or 1", .{rank});
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var g = try cuda.tp_group.Group.open(gpu.d, rank, 2);
++    defer g.close();
++    try g.openMgbeZc(a, gpu.d, s, cap);
++    try check.expect(g.zc != null, "mgbe-zc-gather: /dev/mgbe_zc did not come up on both ranks", .{});
++
++    const most = cap;
++    var mine = try cuda.DeviceBuffer.alloc(gpu.d, most);
++    defer mine.free();
++    var by_group = try cuda.DeviceBuffer.alloc(gpu.d, 2 * most);
++    defer by_group.free();
++    var by_nccl = try cuda.DeviceBuffer.alloc(gpu.d, 2 * most);
++    defer by_nccl.free();
++    const host = try a.alloc(u8, most);
++    defer a.free(host);
++    const got = try a.alloc(u8, 2 * most);
++    defer a.free(got);
++    const want = try a.alloc(u8, 2 * most);
++    defer a.free(want);
++
++    for (sizes) |n| for ([_]u64{ 1, 2 }) |seed| {
++        shard(host[0..n], seed, rank);
++        try mine.upload(0, host[0..n]);
++        try g.allGather(s, mine.ptr, by_group.ptr, n);
++        try g.lib.check(g.lib.api.ncclAllGather(mine.ptr, by_nccl.ptr, n, .u8, g.comm, s.handle), "ncclAllGather");
++        try s.synchronize();
++        try g.check();
++        expected(want, n, seed);
++        try by_group.download(0, got[0 .. 2 * n]);
++        try check.sameBytes("mgbe_zc all-gather vs expected", got[0 .. 2 * n], want[0 .. 2 * n]);
++        try by_nccl.download(0, got[0 .. 2 * n]);
++        try check.sameBytes("NCCL all-gather vs expected", got[0 .. 2 * n], want[0 .. 2 * n]);
++        if (seed == 2 and rank == 0) std.debug.print("  mgbe-zc-gather size {d} B OK\n", .{n});
++    };
++    check.pass("mgbe-zc-gather rank {d}: all {d} sizes (64 B..16 MiB, eager + DDP + short tail) bit-exact", .{ rank, sizes.len });
++
++    // CUDA Graph capture + replay (decode-sized gathers)
++    try replays(gpu, &g, s, rank);
++
++    // Stress: 200 mixed eager + 16 bulk DDP back-to-back
++    for (0..200) |i| {
++        const n = ([_]usize{ 4096, 16384, 32768, 65536, 131072 })[i % 5];
++        const seed: u64 = 1000 + i;
++        shard(host[0..n], seed, rank);
++        try mine.upload(0, host[0..n]);
++        try g.allGather(s, mine.ptr, by_group.ptr, n);
++        try s.synchronize();
++        try g.check();
++        expected(want, n, seed);
++        try by_group.download(0, got[0 .. 2 * n]);
++        try check.sameBytes("mgbe_zc eager stress", got[0 .. 2 * n], want[0 .. 2 * n]);
++    }
++    for (0..16) |i| {
++        const n = ([_]usize{ 2 << 20, 4 << 20, 8 << 20, 16 << 20 })[i % 4];
++        const seed: u64 = 2000 + i;
++        shard(host[0..n], seed, rank);
++        try mine.upload(0, host[0..n]);
++        try g.allGather(s, mine.ptr, by_group.ptr, n);
++        try s.synchronize();
++        try g.check();
++        expected(want, n, seed);
++        try by_group.download(0, got[0 .. 2 * n]);
++        try check.sameBytes("mgbe_zc DDP stress", got[0 .. 2 * n], want[0 .. 2 * n]);
++    }
++    check.pass("mgbe-zc-gather rank {d}: 200 eager + 16 DDP stress exchanges passed", .{rank});
++
++    // Timing: mgbe_zc vs NCCL across decode & prefill sizes
++    var t0 = try cuda.Event.init(gpu.d, true);
++    defer t0.deinit();
++    var t1 = try cuda.Event.init(gpu.d, true);
++    defer t1.deinit();
++    for ([_]struct { n: usize, reps: usize }{
++        .{ .n = 4096, .reps = 500 },
++        .{ .n = 16384, .reps = 500 },
++        .{ .n = 32768, .reps = 500 },
++        .{ .n = 65536, .reps = 300 },
++        .{ .n = 2 << 20, .reps = 20 },
++        .{ .n = 8 << 20, .reps = 10 },
++        .{ .n = 16 << 20, .reps = 6 },
++    }) |tc| {
++        var us: [2]f64 = undefined;
++        for (0..2) |which| {
++            for (0..2) |round| {
++                try t0.record(s);
++                for (0..tc.reps) |_| {
++                    if (which == 0)
++                        try g.allGather(s, mine.ptr, by_group.ptr, tc.n)
++                    else
++                        try g.lib.check(g.lib.api.ncclAllGather(mine.ptr, by_nccl.ptr, tc.n, .u8, g.comm, s.handle), "ncclAllGather");
++                }
++                try t1.record(s);
++                try t1.synchronize();
++                if (round == 1) us[which] = @as(f64, try cuda.Event.elapsedMs(t0, t1)) * 1000.0 / @as(f64, @floatFromInt(tc.reps));
++            }
++        }
++        try g.check();
++        const gbps_zc = (@as(f64, @floatFromInt(tc.n)) * 8.0) / (us[0] * 1000.0);
++        const gbps_nccl = (@as(f64, @floatFromInt(tc.n)) * 8.0) / (us[1] * 1000.0);
++        check.pass("mgbe-zc-gather rank {d}: {d} B/rank: mgbe_zc {d:.1} us ({d:.2} Gbps/dir) vs NCCL {d:.1} us ({d:.2} Gbps/dir)", .{
++            rank, tc.n, us[0], gbps_zc, us[1], gbps_nccl,
++        });
++    }
++}
++
++fn replays(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize) !void {
++    const a = gpu.gpa;
++    const n: usize = 16384;
++    var mine = try cuda.DeviceBuffer.alloc(gpu.d, graph_gathers * n);
++    defer mine.free();
++    var all = try cuda.DeviceBuffer.alloc(gpu.d, graph_gathers * 2 * n);
++    defer all.free();
++    try cuda.graph.beginCapture(s, .thread_local);
++    for (0..graph_gathers) |i| try g.allGather(s, mine.ptr + i * n, all.ptr + i * 2 * n, n);
++    var captured = try cuda.graph.endCapture(s);
++    defer captured.deinit();
++    var exec = try captured.instantiate();
++    defer exec.deinit();
++    const host = try a.alloc(u8, graph_gathers * n);
++    defer a.free(host);
++    const got = try a.alloc(u8, graph_gathers * 2 * n);
++    defer a.free(got);
++    const want = try a.alloc(u8, graph_gathers * 2 * n);
++    defer a.free(want);
++    for (0..graph_replays) |r| {
++        for (0..graph_gathers) |i| {
++            const seed = 500 + r * graph_gathers + i;
++            shard(host[i * n ..][0..n], seed, rank);
++            expected(want[i * 2 * n ..][0 .. 2 * n], n, seed);
++        }
++        try mine.upload(0, host);
++        try exec.launchOn(s);
++        try s.synchronize();
++        try g.check();
++        try all.download(0, got);
++        try check.sameBytes("mgbe_zc graph replay", got, want);
++    }
++    check.pass("mgbe-zc-gather rank {d}: CUDA Graph ({d} gathers x {d} replays) bit-exact", .{ rank, graph_gathers, graph_replays });
++}
+-- 
+2.43.0
+

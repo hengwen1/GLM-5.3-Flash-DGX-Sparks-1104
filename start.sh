@@ -32,7 +32,7 @@ URL="http://$API_HOST:$PORT"
 FIT_FILE="$STATE_DIR/context-fit.tsv"
 fit_key() {
   printf '%s|' "$PATCHES_HASH" "$MODEL_DIR" "$WORKER" "$TP" "$PARALLEL" "$KV" "$KV_PAGES" "$DENSE" "$HEAD" "$VISION" "$VISION_MAX_IMAGES" \
-    "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CACHE_FIRST" "$HOST_CACHE_GIB" "$LEARN_GIB" "$KV_SHARD" "$ROCE" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
+    "$DRAFTER" "$DRAFTER_BITS" "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CACHE_FIRST" "$HOST_CACHE_GIB" "$LEARN_GIB" "$KV_SHARD" "$ROCE" "$MGBE_ZC" "$GLM_MM_CUBLAS" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" \
     | sha256sum | cut -c1-16
 }
 fit_boot_id() {
@@ -192,19 +192,28 @@ declare -a PASS_ENV=()
 WORKER_ENV_FILE=''
 MANAGED_ENV=' HOME HF_HUB_OFFLINE CUDA_DEVICE_ORDER CUDA_VISIBLE_DEVICES TENSORFOLD_NO_UPDATE_CHECK TENSORFOLD_NO_LIVE
  TENSORFOLD_MEMORY_RESERVE_GIB TF_GLM_DENSE_BITS TF_GLM_HEAD_BITS TF_GLM_CLEAR_THINKING TF_GLM_RANK TF_GLM_WORLD TF_CUDA_DEVICE
- TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_PROMPT_CACHE_FIRST TF_GLM_KV_SHARD TF_GLM_L2PF TF_EXTRA_EOS TF_THINK_OFF_SPLIT
- TF_ROCE TF_ROCE_MAX_KB TF_ROCE_HCA TF_BIN TF_REPO TF_REF
- NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS '
+ TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TF_GLM_HOST_CACHE_GIB TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_PROMPT_CACHE_FIRST TF_GLM_KV_SHARD TF_GLM_L2PF TF_EXTRA_EOS TF_THINK_OFF_SPLIT TF_GLM_MM_CUBLAS TF_GLM_PREFILL_REDUCE
+ TF_ROCE TF_ROCE_MAX_KB TF_ROCE_HCA TF_MGBE_ZC TF_MGBE_ZC_MAX_KB TF_MGBE_ZC_EAGER_KB TF_MGBE_ZC_PORTS TF_MGBE_ZC_CPUS TF_BIN TF_REPO TF_REF
+ NCCL_COMM_ID NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS '
 # The flags both ranks share. Everything that places a rank is added per rank, so the two fingerprints agree on the rest.
 build_env_args() {
-  local key
+  local key pr
   ENV_ARGS=(-e HOME=/state/home -e HF_HUB_OFFLINE=1 -e TENSORFOLD_NO_UPDATE_CHECK=1 -e TENSORFOLD_NO_LIVE=1
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e "TENSORFOLD_MEMORY_RESERVE_GIB=$MEMORY_RESERVE_GIB"
     -e "TF_GLM_DENSE_BITS=$(bits "$DENSE")" -e "TF_GLM_HEAD_BITS=$(bits "$HEAD")" -e "TF_GLM_CLEAR_THINKING=$CLEAR_THINKING"
     -e "TF_KV_PAGES=$KV_PAGES" -e "TF_GLM_CE_EXCHANGE=$CE_EXCHANGE" -e "TF_GLM_ABSORB_MMA=$ABSORB_MMA" -e "TF_GLM_W8A8=$W8A8"
     -e "TF_CUDA_DEVICE=0" -e "TF_GLM_WORLD=$TP" -e "NCCL_COMM_ID=$LINK_SELF:$NCCL_PORT"
     -e "TF_ROCE=$([[ "$ROCE" == on ]] && echo 1 || echo 0)" -e "TF_ROCE_MAX_KB=$ROCE_MAX_KB"
+    -e "TF_MGBE_ZC=$([[ "$MGBE_ZC" == on ]] && echo 1 || echo 0)"
     -e "TF_BIN=$TF_BIN" -e "TENSORFOLD_PREFILL_SHARE=$PREFILL_SHARE")
+  if [[ "$MGBE_ZC" == on ]]; then
+    ENV_ARGS+=(-e "TF_MGBE_ZC_MAX_KB=$MGBE_ZC_MAX_KB" -e "TF_MGBE_ZC_EAGER_KB=$MGBE_ZC_EAGER_KB")
+    [[ -z "$MGBE_ZC_CPUS" ]] || ENV_ARGS+=(-e "TF_MGBE_ZC_CPUS=$MGBE_ZC_CPUS")
+  fi
+  pr=$TP2_PREFILL_REDUCE
+  [[ "$pr" != auto ]] || pr=$([[ "$MGBE_ZC" == on ]] && echo gather || echo split)
+  [[ "$pr" == split ]] || ENV_ARGS+=(-e "TF_GLM_PREFILL_REDUCE=$pr")
+  [[ "$GLM_MM_CUBLAS" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_MM_CUBLAS=1")
   [[ -z "$HOST_CACHE_GIB" ]] || ENV_ARGS+=(-e "TF_GLM_HOST_CACHE_GIB=$HOST_CACHE_GIB")
   [[ -z "$PREFILL_BUDGET" ]] || ENV_ARGS+=(-e "TENSORFOLD_PREFILL_BUDGET=$PREFILL_BUDGET")
   # CACHE_FIRST=1: engine patch 0112 sets PROMPT_CACHE_GIB aside before the streams' windows (both ranks alike)
@@ -247,7 +256,17 @@ write_worker_env() {
 rank_env_args() {
   local r=$1
   RANK_ENV=(-e "TF_GLM_RANK=$r")
-  if (( r == 0 )); then
+  if [[ "$LINK_KIND" == tcp ]]; then
+    if (( r == 0 )); then
+      RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=$LINK_DEV" -e NCCL_IB_DISABLE=1)
+      local zp="${MGBE_ZC_PORTS:-$LINK_ZC_PORTS}"
+      [[ "$MGBE_ZC" != on || -z "$zp" ]] || RANK_ENV+=(-e "TF_MGBE_ZC_PORTS=$zp")
+    else
+      RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=$WORKER_DEV" -e NCCL_IB_DISABLE=1)
+      local zp="${MGBE_ZC_PORTS:-$WORKER_ZC_PORTS}"
+      [[ "$MGBE_ZC" != on || -z "$zp" ]] || RANK_ENV+=(-e "TF_MGBE_ZC_PORTS=$zp")
+    fi
+  elif (( r == 0 )); then
     RANK_ENV+=(-e "NCCL_SOCKET_IFNAME=$LINK_DEV" -e "NCCL_IB_HCA=$LINK_HCA" -e "NCCL_IB_GID_INDEX=$LINK_GID")
     [[ "$ROCE" != on ]] || RANK_ENV+=(-e "TF_ROCE_HCA=$LINK_HCA")
   else
@@ -257,11 +276,23 @@ rank_env_args() {
   RANK_ENV+=(-e "NCCL_MIN_NCHANNELS=$NCCL_CHANNELS" -e "NCCL_MAX_NCHANNELS=$NCCL_CHANNELS")
 }
 
-# Every container gets the GPU, the host network (NCCL_COMM_ID is a host address), the RDMA devices and the locked
-# memory the RoCE region and NCCL's IB transport need.
-RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --cap-add IPC_LOCK
-          --ulimit memlock=-1 --ulimit stack=67108864)
-[[ ! -e /dev/infiniband ]] || RUN_ARGS+=(--device /dev/infiniband)
+# Per-node container runtime flags (GPU passthrough, CUDA floor compat, /dev/infiniband, /dev/mgbe_zc + udev group).
+build_run_args() {
+  RUN_ARGS=(--ipc=host --network host --shm-size 16g --cap-add IPC_LOCK
+            --ulimit memlock=-1 --ulimit stack=67108864)
+  [[ ! -e /dev/infiniband ]] || RUN_ARGS+=(--device /dev/infiniband)
+  local -a gpu_local=() gpu_worker=() zc_local=() zc_worker=()
+  mapfile -t gpu_local < <(gpu_args '')
+  mapfile -t gpu_worker < <(gpu_args worker)
+  if [[ "$MGBE_ZC" == on ]]; then
+    zc_local=(--device /dev/mgbe_zc)
+    [[ -z "${MGBE_ZC_GID_LOCAL:-}" ]] || zc_local+=(--group-add "$MGBE_ZC_GID_LOCAL")
+    zc_worker=(--device /dev/mgbe_zc)
+    [[ -z "${MGBE_ZC_GID_WORKER:-}" ]] || zc_worker+=(--group-add "$MGBE_ZC_GID_WORKER")
+  fi
+  RUN_ARGS_LOCAL=("${gpu_local[@]}" "${RUN_ARGS[@]}" "${zc_local[@]}")
+  RUN_ARGS_WORKER=("${gpu_worker[@]}" "${RUN_ARGS[@]}" "${zc_worker[@]}")
+}
 
 # The ranks' command lines, as each Spark starts them.
 show_ranks() {
@@ -349,6 +380,7 @@ launch() {
   local worker_ug='' unwritable
   build_serve_args "$ctx"
   build_env_args
+  build_run_args
   [[ -z "$CONTAINER_USER" ]] || user_args=(--user "$CONTAINER_USER")
   worker_user_args=("${user_args[@]}")
   # The worker's own login when CONTAINER_USER is this Spark's (the default, or set to the same value): the two logins
@@ -393,7 +425,7 @@ launch() {
   done
   [[ -z "$WORKER_ENV_FILE" ]] || worker_env+=(--env-file "$WORKER_ENV_FILE")
   wcmd=(docker run -d --name "$CONTAINER_NAME" --label tf.recipe=glm53-spark --label "tf.patches=$PATCHES_HASH"
-    --init --restart=no "${RUN_ARGS[@]}" "${worker_user_args[@]}" "${worker_env[@]}" "${RANK_ENV[@]}"
+    --init --restart=no "${RUN_ARGS_WORKER[@]}" "${worker_user_args[@]}" "${worker_env[@]}" "${RANK_ENV[@]}"
     "${WORKER_MOUNTS[@]}" -v "$WORKER_CACHE_DIR:/state")
   [[ -z "$TEMPLATE_FILE" ]] || wcmd+=(-v "$WORKER_TEMPLATE:/templates/chat_template.jinja:ro")
   wcmd+=(--entrypoint "$TF_BIN" "$IMAGE" serve /model "${SERVE_ARGS[@]}")
@@ -412,7 +444,7 @@ launch() {
   [[ -z "$TEMPLATE_FILE" ]] || mounts+=(-v "$TEMPLATE_FILE:/templates/chat_template.jinja:ro")
   mounts+=(-v "$CACHE_DIR:/state")
   cmd=(docker run -d --name "$CONTAINER_NAME" --label tf.recipe=glm53-spark --label "tf.patches=$PATCHES_HASH"
-    --init --restart=no "${RUN_ARGS[@]}" "${user_args[@]}" "${ENV_ARGS[@]}" "${RANK_ENV[@]}" "${mounts[@]}"
+    --init --restart=no "${RUN_ARGS_LOCAL[@]}" "${user_args[@]}" "${ENV_ARGS[@]}" "${RANK_ENV[@]}" "${mounts[@]}"
     --entrypoint "$TF_BIN" "$IMAGE" serve /model "${SERVE_ARGS[@]}")
   if [[ "$DRY_RUN" == 1 ]]; then log 'Here:'; plan "${cmd[@]}"; return 0; fi
   "${cmd[@]}" >/dev/null || { stop_both; fail E_START 'Docker could not launch rank 0. Check its error and rerun.'; }

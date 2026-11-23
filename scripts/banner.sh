@@ -60,5 +60,5 @@ banner() {
   # the checkpoint served: EXL3 4-bit, or Z.AI's block FP8 with FP8=1 (four Sparks only)
   local weights=EXL3; [[ "${FP8:-0}" != 1 ]] || weights='block FP8'
   printf '%s%s%s\n' "$AE_WHITE" "GLM-5.3-Flash $weights | TensorFold native engine (Zig) | by Mia's AI Lab" "$AE_RESET"
-  printf '%s%s%s\n' "$AE_INK" "TensorFold ${TF_REF:0:8} + ${PATCH_COUNT:-0} engine patches | ${TP:-2}x DGX Spark (GB10, sm_${SM:-121}), tensor parallel ${TP:-2} | API :${PORT:-8020}" "$AE_RESET"
+  printf '%s%s%s\n' "$AE_INK" "TensorFold ${TF_REF:0:8} + ${PATCH_COUNT:-0} engine patches | ${TP:-2}x aarch64 node (sm_${SM:-121}), tensor parallel ${TP:-2} | API :${PORT:-8020}" "$AE_RESET"
 }
