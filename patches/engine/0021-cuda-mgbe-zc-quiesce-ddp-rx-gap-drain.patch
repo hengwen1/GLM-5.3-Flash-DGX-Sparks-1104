@@ -1,0 +1,215 @@
+diff --git a/zig/src/cuda/mgbe_zc.zig b/zig/src/cuda/mgbe_zc.zig
+index 0a1e368..064bea0 100644
+--- a/zig/src/cuda/mgbe_zc.zig
++++ b/zig/src/cuda/mgbe_zc.zig
+@@ -541,6 +541,24 @@ const Queue = struct {
+         q.ringRx();
+     }
+ 
++    fn postDdpDrain(q: *Queue, scratch_iova: u64, npkts: u32) void {
++        const rx = q.rx_ring.?;
++        for (0..npkts) |_| {
++            const idx = q.rx_prod & uapi.ring_mask;
++            cacheInvalRange(q.rx_buf_va + @as(usize, idx) * q.rx_stride, hdr_bytes + 64);
++            const hiova = q.rx_buf_iova + @as(u64, idx) * q.rx_stride;
++            rx[idx].d0 = @truncate(hiova);
++            rx[idx].d1 = @truncate(hiova >> 32);
++            rx[idx].d2 = @truncate(scratch_iova);
++            dmbOshst();
++            @atomicStore(u32, &rx[idx].d3, (@as(u32, @truncate(scratch_iova >> 32)) & 0xFFFF) | uapi.desc_own, .release);
++            q.rx_prod +%= 1;
++        }
++        const tail = q.rx_prod & uapi.ring_mask;
++        rx[tail].d3 = 0;
++        q.ringRx();
++    }
++
+     const DataComp = struct { hdr: WireHdr, plen: u32, err: bool };
+ 
+     fn dumpState(q: *const Queue, tag: []const u8) void {
+@@ -1283,6 +1301,8 @@ pub const Gather = struct {
+             var rx_skip: u32 = 0;
+             var rx_gap = false;
+             var rx_acked = false;
++            var rx_draining = false;
++            var rx_drain_since: u64 = 0;
+             var peer_cts_gen: u32 = 0;
+             const t_win = nowNs();
+             var last_cts_tx = t_win;
+@@ -1383,45 +1403,75 @@ pub const Gather = struct {
+ 
+                 // Poll RX DDP completions
+                 var drained_any = false;
+-                while (!rx_acked and (rx_skip > 0 or rx_got < win_pkts)) {
+-                    const comp = rl.data_q.pollDataRx() orelse break;
+-                    drained_any = true;
+-                    last_rx_activity = nowNs();
+-                    if (rx_skip > 0) {
+-                        rx_skip -= 1;
+-                        continue;
++                if (rx_draining) {
++                    while (rl.data_q.pollDataRx()) |_| {
++                        drained_any = true;
++                        rx_drain_since = nowNs();
++                        last_rx_activity = rx_drain_since;
+                     }
+-                    if (comp.err or comp.hdr.seq != seq or comp.hdr.win_start != win_start or comp.hdr.psn != rx_got) {
+-                        rx_gap = true;
++                    const avail: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                    if (avail < 32 and avail + 64 + win_pkts < uapi.ring_desc_cnt - 16) {
++                        rl.data_q.postDdpDrain(recv_iova + win_off, 64);
+                     }
+-                    rx_got += 1;
+-                }
+-                if (!rx_acked and rx_skip == 0 and rx_got == win_pkts) {
+-                    if (!rx_gap) {
+-                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
+-                            .opcode = @intFromEnum(Op.ack),
+-                            .seq = seq,
+-                            .win_start = win_start,
+-                            .win_pkts = @intCast(win_pkts),
+-                        });
+-                        rx_acked = true;
+-                        rl.ddp_rx_acked = true;
+-                        last_ack_tx = nowNs();
+-                    } else {
+-                        // Clean Go-Back-N recovery: 0 leftover descriptors, post fresh window and request resend.
+-                        rx_got = 0;
+-                        rx_gap = false;
+-                        cts_gen +%= 1;
+-                        rl.retrans_cnt += 1;
+-                        rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
+-                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
+-                            .opcode = @intFromEnum(Op.nack),
+-                            .seq = seq,
+-                            .win_start = win_start,
+-                            .win_pkts = 0,
+-                            .cts_gen = cts_gen,
+-                        });
++                    const t_d = nowNs();
++                    if ((t_d - rx_drain_since) >= 1_000_000) {
++                        // Wire has been quiet for 1 ms: post a fresh aligned window behind the remaining drain descriptors.
++                        const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                        if (rem + win_pkts < uapi.ring_desc_cnt - 16) {
++                            rx_draining = false;
++                            rx_skip = rem;
++                            rx_got = 0;
++                            rx_gap = false;
++                            cts_gen +%= 1;
++                            rl.retrans_cnt += 1;
++                            rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
++                            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                .opcode = @intFromEnum(Op.nack),
++                                .seq = seq,
++                                .win_start = win_start,
++                                .win_pkts = @intCast(rem),
++                                .cts_gen = cts_gen,
++                            });
++                            last_rx_activity = t_d;
++                        }
++                    }
++                } else {
++                    while (!rx_acked and (rx_skip > 0 or rx_got < win_pkts)) {
++                        const comp = rl.data_q.pollDataRx() orelse break;
++                        drained_any = true;
+                         last_rx_activity = nowNs();
++                        if (rx_skip > 0) {
++                            rx_skip -= 1;
++                            continue;
++                        }
++                        if (comp.err or comp.hdr.seq != seq or comp.hdr.win_start != win_start or comp.hdr.cts_gen != cts_gen or comp.hdr.psn != rx_got) {
++                            rx_gap = true;
++                        }
++                        rx_got += 1;
++                    }
++                    if (!rx_acked and rx_skip == 0 and rx_got == win_pkts) {
++                        if (!rx_gap) {
++                            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                .opcode = @intFromEnum(Op.ack),
++                                .seq = seq,
++                                .win_start = win_start,
++                                .win_pkts = @intCast(win_pkts),
++                            });
++                            rx_acked = true;
++                            rl.ddp_rx_acked = true;
++                            last_ack_tx = nowNs();
++                        } else {
++                            // Misaligned/gap window: quiesce any still-in-flight trailing packets into drain descriptors
++                            // before posting the next aligned window + NACK, preventing phase-shift livelock.
++                            rx_draining = true;
++                            rx_drain_since = nowNs();
++                            rx_got = 0;
++                            rx_gap = false;
++                            if (rl.data_q.rx_prod -% rl.data_q.rx_cons + 64 + win_pkts < uapi.ring_desc_cnt - 16) {
++                                rl.data_q.postDdpDrain(recv_iova + win_off, 64);
++                            }
++                            last_rx_activity = rx_drain_since;
++                        }
+                     }
+                 }
+ 
+@@ -1437,13 +1487,14 @@ pub const Gather = struct {
+                     last_ack_tx = t;
+                 }
+                 // Re-send our CTS while peer hasn't delivered any packet for our RX window yet (independent of tx_allowed!).
+-                if (!rx_acked and rx_skip == 0 and rx_got == 0 and (t - last_cts_tx) >= 1_000_000) {
++                if (!rx_acked and !rx_draining and rx_skip == 0 and rx_got == 0 and (t - last_cts_tx) >= 1_000_000) {
+                     // If peer is already at >= seq and we received 0 packets for 50ms, handle total-loss window by
+                     // posting a fresh aligned DDP RX window behind the leftover descriptors and sending NACK with a new cts_gen.
++                    const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
+                     if (@as(i32, @bitCast(rl.peer_max_seq -% seq)) >= 0 and (t - last_rx_activity) >= 50_000_000 and
+-                        rl.data_q.rx_prod -% rl.data_q.rx_cons + win_pkts < uapi.ring_desc_cnt - 16)
++                        rem + win_pkts < uapi.ring_desc_cnt - 16)
+                     {
+-                        rx_skip = win_pkts;
++                        rx_skip = rem;
+                         rx_got = 0;
+                         rx_gap = false;
+                         cts_gen +%= 1;
+@@ -1453,7 +1504,7 @@ pub const Gather = struct {
+                             .opcode = @intFromEnum(Op.nack),
+                             .seq = seq,
+                             .win_start = win_start,
+-                            .win_pkts = @intCast(win_pkts),
++                            .win_pkts = @intCast(rem),
+                             .cts_gen = cts_gen,
+                         });
+                         last_rx_activity = t;
+@@ -1472,9 +1523,9 @@ pub const Gather = struct {
+                 }
+                 // Partial RX window stalled (a packet dropped on the wire): post a fresh aligned window behind the
+                 // `rem` leftover descriptors and ask peer to flush `rem` short frames then resend the window.
+-                if (!rx_acked and (rx_skip > 0 or (rx_got > 0 and rx_got < win_pkts)) and !drained_any and (t - last_rx_activity) >= 5_000_000) {
+-                    const rem: u32 = rx_skip + (win_pkts - rx_got);
+-                    if (rl.data_q.rx_prod -% rl.data_q.rx_cons + win_pkts < uapi.ring_desc_cnt - 16) {
++                if (!rx_acked and !rx_draining and (rx_skip > 0 or (rx_got > 0 and rx_got < win_pkts)) and !drained_any and (t - last_rx_activity) >= 5_000_000) {
++                    const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                    if (rem + win_pkts < uapi.ring_desc_cnt - 16) {
+                         rx_skip = rem;
+                         rx_got = 0;
+                         rx_gap = false;
+@@ -1488,14 +1539,22 @@ pub const Gather = struct {
+                             .win_pkts = @intCast(rem),
+                             .cts_gen = cts_gen,
+                         });
++                    } else if (rx_skip > 0 and rx_got == 0) {
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.nack),
++                            .seq = seq,
++                            .win_start = win_start,
++                            .win_pkts = @intCast(rx_skip),
++                            .cts_gen = cts_gen,
++                        });
+                     }
+                     last_rx_activity = t;
+                 }
+                 if (t - t_win >= g.timeout_ns) {
+-                    std.log.err("mgbe_zc timeout port {d} DDP seq {d} win {d} (rx={d}/{d} skip={d} ack_rx={} tx={d}/{d} ack_tx={} peer_max_seq={d} retrans={d})", .{ rl.port, seq, win_start, rx_got, win_pkts, rx_skip, rx_acked, tx_sent, win_pkts, tx_acked, rl.peer_max_seq, rl.retrans_cnt });
++                    std.log.err("mgbe_zc timeout port {d} DDP seq {d} win {d} (rx={d}/{d} skip={d} drain={} ack_rx={} tx={d}/{d} ack_tx={} peer_max_seq={d} retrans={d})", .{ rl.port, seq, win_start, rx_got, win_pkts, rx_skip, rx_draining, rx_acked, tx_sent, win_pkts, tx_acked, rl.peer_max_seq, rl.retrans_cnt });
+                     rl.ctrl_q.dumpState("ctrl_q");
+                     rl.data_q.dumpState("data_q");
+-                    g.fail("port {d} DDP seq {d} win {d} timed out (rx={d}/{d} skip={d} ack_rx={} tx={d}/{d} ack_tx={} peer_max_seq={d} retrans={d})", .{ rl.port, seq, win_start, rx_got, win_pkts, rx_skip, rx_acked, tx_sent, win_pkts, tx_acked, rl.peer_max_seq, rl.retrans_cnt });
++                    g.fail("port {d} DDP seq {d} win {d} timed out (rx={d}/{d} skip={d} drain={} ack_rx={} tx={d}/{d} ack_tx={} peer_max_seq={d} retrans={d})", .{ rl.port, seq, win_start, rx_got, win_pkts, rx_skip, rx_draining, rx_acked, tx_sent, win_pkts, tx_acked, rl.peer_max_seq, rl.retrans_cnt });
+                     return error.ProxyFailed;
+                 }
+             }
