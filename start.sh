@@ -706,6 +706,13 @@ if [[ "$DRY_RUN" != 1 ]] && ! wait_ready; then
   done
 fi
 [[ "$DRY_RUN" == 1 ]] || check_cache_min
+if [[ "$DRY_RUN" != 1 ]]; then
+  RESTART_POLICY="${RESTART_POLICY:-unless-stopped}"
+  docker update --restart="$RESTART_POLICY" "$CONTAINER_NAME" >/dev/null \
+    || warn W_START "Could not set restart policy '$RESTART_POLICY' on rank 0."
+  wssh docker update --restart="$RESTART_POLICY" "$CONTAINER_NAME" >/dev/null \
+    || warn W_START "Could not set restart policy '$RESTART_POLICY' on rank 1 ($(worker_host))."
+fi
 start_memguard
 finish_start
 if [[ "$DRY_RUN" != 1 ]]; then
