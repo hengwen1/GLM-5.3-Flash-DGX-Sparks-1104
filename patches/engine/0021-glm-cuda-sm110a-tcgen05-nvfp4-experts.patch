@@ -1,0 +1,473 @@
+diff --git a/zig/kernels/cuda/nvfp4_experts.cu b/zig/kernels/cuda/nvfp4_experts.cu
+index 5a36075..5c2918d 100644
+--- a/zig/kernels/cuda/nvfp4_experts.cu
++++ b/zig/kernels/cuda/nvfp4_experts.cu
+@@ -568,3 +568,340 @@ TF_NVFP4_PROMPT(tf_nvfp4_prompt_down, 1, 3, 8)
+   }
+ TF_NVFP4_FACT(tf_nvfp4_fact_swiglu, 2, 2, 4)
+ TF_NVFP4_FACT(tf_nvfp4_fact_down_f32, 1, 0, 8)
++
++namespace tf_nvfp4_tcgen05 {
++
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1100 && defined(__CUDA_ARCH_FEAT_SM110_ALL)
++
++__device__ __forceinline__ uint64_t smem_desc(uint32_t smem_addr, uint32_t lbo_bytes, uint32_t sbo_bytes) {
++  uint64_t d = 0;
++  d |= (uint64_t)((smem_addr & 0x3FFFFu) >> 4);
++  d |= (uint64_t)((lbo_bytes & 0x3FFFFu) >> 4) << 16;
++  d |= (uint64_t)((sbo_bytes & 0x3FFFFu) >> 4) << 32;
++  d |= (uint64_t)1ULL << 46;
++  return d;
++}
++
++template <int TPM>
++__device__ __forceinline__ constexpr uint32_t idesc_bf16_m128() {
++  return (1u << 4) | (1u << 7) | (1u << 10) | ((uint32_t)(TPM >> 3) << 17) | (8u << 24);
++}
++
++__device__ __forceinline__ void mbar_init(uint64_t* mbar, uint32_t count) {
++  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(addr), "r"(count) : "memory");
++}
++
++__device__ __forceinline__ void mbar_wait(uint64_t* mbar, uint32_t parity) {
++  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++  asm volatile(
++      "{\n\t"
++      ".reg .pred done;\n\t"
++      "TF_NV4_MBAR_%=:\n\t"
++      "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1, 10000000;\n\t"
++      "@!done bra TF_NV4_MBAR_%=;\n\t"
++      "}\n"
++      :: "r"(addr), "r"(parity) : "memory");
++}
++
++template <int TPM>
++__device__ __forceinline__ void mma_k32(uint32_t taddr, uint32_t a_base, uint32_t b_base, bool accum) {
++  constexpr uint32_t idesc = idesc_bf16_m128<TPM>();
++  const uint64_t da0 = smem_desc(a_base, 128, 512);
++  const uint64_t db0 = smem_desc(b_base, 128, 512);
++  const uint64_t da1 = smem_desc(a_base + 256, 128, 512);
++  const uint64_t db1 = smem_desc(b_base + 256, 128, 512);
++  const uint32_t acc_flag = accum ? 1u : 0u;
++  asm volatile(
++      "{\n\t"
++      ".reg .pred p0, p1;\n\t"
++      "setp.ne.b32 p0, %6, 0;\n\t"
++      "setp.ne.b32 p1, 1, 0;\n\t"
++      "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p0;\n\t"
++      "tcgen05.mma.cta_group::1.kind::f16 [%0], %4, %5, %3, p1;\n\t"
++      "}\n"
++      :: "r"(taddr), "l"(da0), "l"(db0), "r"(idesc), "l"(da1), "l"(db1), "r"(acc_flag) : "memory");
++}
++
++__device__ __forceinline__ void commit(uint64_t* mbar) {
++  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++  asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];" :: "r"(addr) : "memory");
++}
++
++__device__ __forceinline__ void ld16(uint32_t addr, uint32_t (&r)[16]) {
++  asm volatile(
++      "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
++      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];\n\t"
++      "tcgen05.wait::ld.sync.aligned;"
++      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]),
++        "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7]),
++        "=r"(r[8]), "=r"(r[9]), "=r"(r[10]), "=r"(r[11]),
++        "=r"(r[12]), "=r"(r[13]), "=r"(r[14]), "=r"(r[15])
++      : "r"(addr)
++      : "memory");
++}
++
++// sm_110a (Jetson AGX Thor) 5th-gen tensor core NVFP4 MoE prompt kernel:
++// 16 warps (512 threads), 4 x (128 x TPM) fp32 TMEM tiles (4*TPM cols: 256 for TPM=64, 512 for TPM=128),
++// double-buffered A (64 KiB) + STAGES-deep cp.async ring for B and W. Bit-exact vs prompt_body.
++template <int M, int EPI, int TPM, int STAGES>
++__device__ __forceinline__ void prompt_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                                              const uint4* __restrict__ W, const float* __restrict__ scale,
++                                              int KG, int NB, const int* __restrict__ items,
++                                              const int* __restrict__ counts, const int* __restrict__ members,
++                                              void* __restrict__ out, int N, float limit, int skip) {
++  constexpr int BLOCK4 = tf_nvfp4_experts::BLOCK4;
++  constexpr int CB_CTA = (M == 2) ? 8 : 16;
++  const int nbt = (NB + CB_CTA - 1) / CB_CTA;
++  const int it = blockIdx.x / nbt;
++  const int cbt = blockIdx.x - it * nbt;
++  if (it >= __ldg(counts)) return;
++  const int e = __ldg(items + 3 * it);
++  if (e == skip) return;
++  const int first = __ldg(items + 3 * it + 1);
++  const int cnt = __ldg(items + 3 * it + 2);
++
++  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++  const int gq = lane >> 2, t = lane & 3;
++  const int cb0 = cbt * CB_CTA;
++  const int cbs = min(CB_CTA, NB - cb0);
++
++  constexpr int A_TILE_B = 128 * 32 * 2;
++  constexpr int A_SET_B = 4 * A_TILE_B;
++  constexpr int B_STAGE_B = TPM * 32 * 2;
++  constexpr int W_STAGE_U4 = 16 * BLOCK4;
++
++  extern __shared__ __align__(16) unsigned char smem_raw[];
++  unsigned char* A_base = smem_raw;
++  __nv_bfloat16* B_base = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2 * A_SET_B);
++  uint4* W_base = reinterpret_cast<uint4*>(smem_raw + 2 * A_SET_B + STAGES * B_STAGE_B);
++
++  const uint32_t a_base_smem = (uint32_t)__cvta_generic_to_shared(A_base);
++  const uint32_t b_base_smem = (uint32_t)__cvta_generic_to_shared(B_base);
++
++  __shared__ __align__(8) uint64_t mbar[2];
++  __shared__ uint32_t taddr_sh;
++  __shared__ int rows_sh[TPM];
++
++  if (tid < TPM) rows_sh[tid] = (tid < cnt) ? __ldg(members + first + tid) : -1;
++  if (tid == 0) {
++    mbar_init(&mbar[0], 1);
++    mbar_init(&mbar[1], 1);
++  }
++  if (warp == 0) {
++    const uint32_t dst = (uint32_t)__cvta_generic_to_shared(&taddr_sh);
++    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
++                 :: "r"(dst), "n"(4 * TPM) : "memory");
++  }
++  __syncthreads();
++  const uint32_t taddr = taddr_sh;
++
++  const bool has_x = tid < TPM * 4;
++  const int xi = has_x ? (tid >> 2) : 0, xkb = tid & 3;
++  const int xpr = has_x ? rows_sh[xi] : -1;
++  const int xrb = xi >> 3, xrl = xi & 7;
++  const int xdst_off = ((xrb * 4 + xkb) * 8 + xrl) * 8;
++  const __nv_bfloat16* xsrc = (xpr >= 0) ? (X + (size_t)(slots ? xpr / slots : xpr) * x_stride + xkb * 8) : nullptr;
++
++  const uint4* wsrc_base = W + ((size_t)e * NB + cb0) * (size_t)KG * (M * BLOCK4);
++
++  const int w_blk0 = tid / BLOCK4, w_u0 = tid - w_blk0 * BLOCK4;
++  const int w_cb0 = (M == 2) ? (w_blk0 & 7) : w_blk0;
++  const int w_m0 = (M == 2) ? (w_blk0 >> 3) : 0;
++  const bool w_v0 = w_cb0 < cbs;
++  const uint4* wsrc0 = wsrc_base + (size_t)w_cb0 * KG * (M * BLOCK4) + w_m0 * BLOCK4 + w_u0;
++
++  const int tid1 = tid + 512;
++  const bool has1 = tid1 < W_STAGE_U4;
++  const int w_blk1 = has1 ? (tid1 / BLOCK4) : 0;
++  const int w_u1 = has1 ? (tid1 - w_blk1 * BLOCK4) : 0;
++  const int w_cb1 = (M == 2) ? (w_blk1 & 7) : w_blk1;
++  const int w_m1 = (M == 2) ? (w_blk1 >> 3) : 0;
++  const bool w_v1 = has1 && (w_cb1 < cbs);
++  const uint4* wsrc1 = wsrc_base + (size_t)w_cb1 * KG * (M * BLOCK4) + w_m1 * BLOCK4 + w_u1;
++
++  auto stage_k = [&](int s, int g) {
++    if (has_x) {
++      __nv_bfloat16* bdst = B_base + (size_t)s * (TPM * 32);
++      tf_common::cp16z(bdst + xdst_off, xsrc ? (xsrc + (size_t)g * 32) : X, xsrc != nullptr);
++    }
++    uint4* wdst = W_base + (size_t)s * W_STAGE_U4;
++    const size_t goff = (size_t)g * (M * BLOCK4);
++    tf_common::cp16z(wdst + tid, wsrc0 + goff, w_v0);
++    if (has1) tf_common::cp16z(wdst + tid1, wsrc1 + goff, w_v1);
++  };
++
++  const uint32_t b_sel = gq & 1;
++  const uint32_t pick0 = b_sel | 0x4040u | (b_sel << 8);
++  const uint32_t pick1 = (b_sel + 2) | 0x4040u | ((b_sel + 2) << 8);
++  const int kb_t = t >> 1;
++  const int kp_u2 = gq * 2 + (t & 1);
++  const int my_tile = warp >> 2;
++  const int my_w = warp & 3;
++
++#pragma unroll
++  for (int s = 0; s < STAGES - 1; ++s) {
++    if (s < KG) stage_k(s, s);
++    cp_commit();
++  }
++
++  uint32_t phase[2] = {0, 0};
++  for (int g = 0; g < KG; ++g) {
++    const int s = g % STAGES;
++    const int abuf = g & 1;
++    cp_wait<STAGES - 2>();
++    if (g >= 2) {
++      mbar_wait(&mbar[abuf], phase[abuf]);
++      phase[abuf] ^= 1;
++    }
++    __syncthreads();
++
++    const uint4* blk = W_base + (size_t)s * W_STAGE_U4 + warp * BLOCK4;
++    const uint4 wv = blk[lane];
++    const uint2* sc_ptr = reinterpret_cast<const uint2*>(blk + 32);
++    const uint2 sc0 = sc_ptr[(gq >> 1) * 2 + 0];
++    const uint2 sc1 = sc_ptr[(gq >> 1) * 2 + 1];
++    uint2* A_u2 = reinterpret_cast<uint2*>(A_base + abuf * A_SET_B + my_tile * A_TILE_B);
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++      const uint32_t word = comp(wv, j);
++      const int rb = my_w * 4 + j;
++      const uint32_t pk = (j & 1) ? pick1 : pick0;
++      const uint32_t sv0 = tf_nvfp4_experts::e4m3x2(__byte_perm(j < 2 ? sc0.x : sc0.y, 0u, pk));
++      const uint32_t b00 = tf_common::mul2(tf_common::fp4pair(word, 0), sv0);
++      const uint32_t b01 = tf_common::mul2(tf_common::fp4pair(word, 4), sv0);
++      A_u2[(rb * 4 + kb_t) * 16 + kp_u2] = make_uint2(b00, b01);
++      const uint32_t sv1 = tf_nvfp4_experts::e4m3x2(__byte_perm(j < 2 ? sc1.x : sc1.y, 0u, pk));
++      const uint32_t b10 = tf_common::mul2(tf_common::fp4pair(word, 8), sv1);
++      const uint32_t b11 = tf_common::mul2(tf_common::fp4pair(word, 12), sv1);
++      A_u2[(rb * 4 + 2 + kb_t) * 16 + kp_u2] = make_uint2(b10, b11);
++    }
++
++    if (g + STAGES - 1 < KG) stage_k((g + STAGES - 1) % STAGES, g + STAGES - 1);
++    cp_commit();
++
++    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++    __syncthreads();
++    if (tid == 0) {
++      const uint32_t a0 = a_base_smem + (uint32_t)(abuf * A_SET_B);
++      const uint32_t b_slot = b_base_smem + (uint32_t)(s * B_STAGE_B);
++      mma_k32<TPM>(taddr + 0u * (uint32_t)TPM, a0 + 0u * A_TILE_B, b_slot, g > 0);
++      mma_k32<TPM>(taddr + 1u * (uint32_t)TPM, a0 + 1u * A_TILE_B, b_slot, g > 0);
++      mma_k32<TPM>(taddr + 2u * (uint32_t)TPM, a0 + 2u * A_TILE_B, b_slot, g > 0);
++      mma_k32<TPM>(taddr + 3u * (uint32_t)TPM, a0 + 3u * A_TILE_B, b_slot, g > 0);
++      commit(&mbar[abuf]);
++    }
++  }
++  if (KG >= 1) mbar_wait(&mbar[(KG - 1) & 1], phase[(KG - 1) & 1]);
++  if (KG >= 2) mbar_wait(&mbar[(KG - 2) & 1], phase[(KG - 2) & 1]);
++  cp_wait<0>();
++  asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
++  __syncthreads();
++
++  constexpr int EP_STRIDE = 128 + 8;
++  __nv_bfloat16* ep_base = reinterpret_cast<__nv_bfloat16*>(smem_raw);
++  const float g0 = __ldg(scale + e * M + 0);
++  const float g1 = (M == 2) ? __ldg(scale + e * M + 1) : g0;
++  const uint32_t row_off = ((uint32_t)my_w * 32u) << 16;
++
++  if constexpr (M == 2 && EPI == 2) {
++    const int half = my_tile & 1;
++    const int p_off = (my_tile >> 1) * 16;
++    __nv_bfloat16* ep_wg = ep_base + (size_t)my_tile * (16 * EP_STRIDE);
++    const int col_base = cb0 * 32 + half * 128;
++    const int valid_cols = min(128, N - col_base);
++    const int col_l = my_w * 32 + lane;
++    const int wg_tid = my_w * 32 + lane;
++    for (int p0 = 0; p0 < cnt; p0 += 32) {
++      const int pp = p0 + p_off;
++      if (pp < cnt && col_base < N) {
++        uint32_t rg[16], ru[16];
++        ld16(taddr + row_off + (uint32_t)(half * TPM + pp), rg);
++        ld16(taddr + row_off + (uint32_t)((half + 2) * TPM + pp), ru);
++#pragma unroll
++        for (int k = 0; k < 16; ++k) {
++          const float gv = __uint_as_float(rg[k]) * g0;
++          const float uv = __uint_as_float(ru[k]) * g1;
++          ep_wg[k * EP_STRIDE + col_l] = __float2bfloat16_rn(swiglu(gv, uv, limit));
++        }
++      }
++      __syncthreads();
++      if (pp < cnt && col_base < N) {
++        const int np = min(16, cnt - pp);
++        for (int idx = wg_tid; idx < np * 16; idx += 128) {
++          const int k = idx >> 4, c8 = (idx & 15) * 8;
++          if (c8 < valid_cols) {
++            const int pr = rows_sh[pp + k];
++            *reinterpret_cast<uint4*>(reinterpret_cast<__nv_bfloat16*>(out) + (size_t)pr * N + col_base + c8) =
++                *reinterpret_cast<const uint4*>(ep_wg + k * EP_STRIDE + c8);
++          }
++        }
++      }
++      __syncthreads();
++    }
++  } else if constexpr (M == 1 && EPI == 3) {
++    __nv_bfloat16* ep_wg = ep_base + (size_t)my_tile * (16 * EP_STRIDE);
++    const int col_base = cb0 * 32 + my_tile * 128;
++    const int valid_cols = min(128, N - col_base);
++    const int col_l = my_w * 32 + lane;
++    const int wg_tid = my_w * 32 + lane;
++    for (int p0 = 0; p0 < cnt; p0 += 16) {
++      if (col_base < N) {
++        uint32_t rv[16];
++        ld16(taddr + row_off + (uint32_t)(my_tile * TPM + p0), rv);
++#pragma unroll
++        for (int k = 0; k < 16; ++k) {
++          ep_wg[k * EP_STRIDE + col_l] = __float2bfloat16_rn(__uint_as_float(rv[k]) * g0);
++        }
++      }
++      __syncthreads();
++      if (col_base < N) {
++        const int np = min(16, cnt - p0);
++        for (int idx = wg_tid; idx < np * 16; idx += 128) {
++          const int k = idx >> 4, c8 = (idx & 15) * 8;
++          if (c8 < valid_cols) {
++            const int pr = rows_sh[p0 + k];
++            *reinterpret_cast<uint4*>(reinterpret_cast<__nv_bfloat16*>(out) + (size_t)pr * N + col_base + c8) =
++                *reinterpret_cast<const uint4*>(ep_wg + k * EP_STRIDE + c8);
++          }
++        }
++      }
++      __syncthreads();
++    }
++  }
++
++  __syncthreads();
++  if (warp == 0) {
++    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(taddr), "n"(4 * TPM) : "memory");
++  }
++}
++
++#endif
++
++}  // namespace tf_nvfp4_tcgen05
++
++#define TF_NVFP4_TCGEN05(NAME, M, EPI, TPM)                                                                            \
++  extern "C" __global__ void __launch_bounds__(512, 1) NAME(                                                           \
++      const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,                       \
++      const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items, const int* __restrict__ counts,  \
++      const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {                         \
++    (void)X; (void)x_stride; (void)slots; (void)W; (void)scale; (void)KG; (void)NB;                                    \
++    (void)items; (void)counts; (void)members; (void)out; (void)N; (void)limit; (void)skip;                             \
++  }
++
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1100 && defined(__CUDA_ARCH_FEAT_SM110_ALL)
++#undef TF_NVFP4_TCGEN05
++#define TF_NVFP4_TCGEN05(NAME, M, EPI, TPM)                                                                            \
++  extern "C" __global__ void __launch_bounds__(512, 1) NAME(                                                           \
++      const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,                       \
++      const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items, const int* __restrict__ counts,  \
++      const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {                         \
++    tf_nvfp4_tcgen05::prompt_kernel<M, EPI, TPM, 6>(X, x_stride, slots, W, scale, KG, NB, items, counts, members,      \
++                                                    out, N, limit, skip);                                              \
++  }
++#endif
++
++TF_NVFP4_TCGEN05(tf_nvfp4_prompt_swiglu_tcgen05_64, 2, 2, 64)
++TF_NVFP4_TCGEN05(tf_nvfp4_prompt_down_tcgen05_64, 1, 3, 64)
++TF_NVFP4_TCGEN05(tf_nvfp4_prompt_swiglu_tcgen05_128, 2, 2, 128)
++TF_NVFP4_TCGEN05(tf_nvfp4_prompt_down_tcgen05_128, 1, 3, 128)
+diff --git a/zig/src/cuda/experts.zig b/zig/src/cuda/experts.zig
+index 3f7bb4d..8d437c6 100644
+--- a/zig/src/cuda/experts.zig
++++ b/zig/src/cuda/experts.zig
+@@ -104,7 +104,7 @@ pub const Grouped = struct {
+                 return a.runPrompt(s, epi == .up, in, l, p, out, items);
+             },
+             .fp8g => return (g.fp8g orelse return error.FormatNotLoaded).run(s, epi, in, l, p, true, out, items, skip),
+-            .nvfp4 => return (g.nvfp4 orelse return error.FormatNotLoaded).runPrompt(s, epi, in, l, p, out, items, skip),
++            .nvfp4 => return (g.nvfp4 orelse return error.FormatNotLoaded).runPromptTile(s, epi, in, l, p, out, items, tile, skip),
+             .nvfp4_csf0 => return (g.nvfp4_csf0 orelse return error.FormatNotLoaded).runPrompt(s, epi, in, l, p, out, items, skip),
+             .iq2xxs => return iq2Run(g.iq2xxs orelse return error.FormatNotLoaded, s, true, epi, in, l, p, out, items, skip),
+             .bf16 => return (g.bf16 orelse return error.FormatNotLoaded).run(s, true, epi, in, l, p, out, items, skip),
+@@ -338,17 +338,22 @@ pub const Fp8Experts = struct {
+     }
+ };
+ 
+-/// NVFP4 experts (nvfp4_experts.cu): decode rows 16 pairs at a time; prompt rows staged, 64 pairs a CTA.
++/// NVFP4 experts (nvfp4_experts.cu): decode rows 16 pairs at a time; prompt rows staged, 64 pairs a CTA (or 128 on sm_110a tcgen05).
+ pub const Nvfp4Experts = struct {
+     mod: Module,
+     fns: [7]Function, // by Epi, then relu^2 up, then experts_waves.zig's
+     resident: [7]usize, // blocks the grid may hold: per SM times SMs
+     prompt_fns: [3]Function, // relu^2 up, SwiGLU gate-up, bf16 sums down
+     fact_fns: [2]Function, // the decode form's sums on prompt tiles: SwiGLU gate-up, fp32 down
++    tcgen05: bool = false, // sm_110a (Jetson AGX Thor) 5th-gen tensor core prompt kernels
++    tc_prompt_64: [2]Function = undefined, // SwiGLU gate-up, bf16 sums down (TPM=64)
++    tc_prompt_128: [2]Function = undefined, // SwiGLU gate-up, bf16 sums down (TPM=128)
+     warps: usize = 4,
+ 
+     pub const cols = 32; // output columns a block
+     pub const words = 144; // int32 a (32 columns, 32 inputs) block: 128 code words, then 16 of e4m3 scales
++    pub const tc_smem_64: u32 = 2 * (4 * 8192) + 6 * (64 * 32 * 2) + 6 * (16 * 36 * 16); // 145,408 B
++    pub const tc_smem_128: u32 = 2 * (4 * 8192) + 6 * (128 * 32 * 2) + 6 * (16 * 36 * 16); // 169,984 B
+ 
+     pub const symbols = struct {
+         pub const gate_up = "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+@@ -357,6 +362,8 @@ pub const Nvfp4Experts = struct {
+         pub const up_relu2 = "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi1ELi1ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+         pub const prompt = [3][:0]const u8{ "tf_nvfp4_prompt_relu2", "tf_nvfp4_prompt_swiglu", "tf_nvfp4_prompt_down" };
+         pub const fact = [2][:0]const u8{ "tf_nvfp4_fact_swiglu", "tf_nvfp4_fact_down_f32" };
++        pub const tc_prompt_64 = [2][:0]const u8{ "tf_nvfp4_prompt_swiglu_tcgen05_64", "tf_nvfp4_prompt_down_tcgen05_64" };
++        pub const tc_prompt_128 = [2][:0]const u8{ "tf_nvfp4_prompt_swiglu_tcgen05_128", "tf_nvfp4_prompt_down_tcgen05_128" };
+     };
+ 
+     /// The fact entries' warps a CTA (32-column blocks): SwiGLU gate-up, fp32 down; their parts, 2 and 1.
+@@ -411,6 +418,19 @@ pub const Nvfp4Experts = struct {
+             f.* = try mod.function(name);
+             try f.allowDynamicShared(promptSmem(parts, wn));
+         }
++        const tc_off = if (std.c.getenv("TF_NVFP4_TCGEN05")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
++        const cc = d.currentCapability() catch 0;
++        if (!tc_off and cc == 110) {
++            for (symbols.tc_prompt_64, &e.tc_prompt_64) |name, *f| {
++                f.* = try mod.function(name);
++                try f.allowDynamicShared(tc_smem_64);
++            }
++            for (symbols.tc_prompt_128, &e.tc_prompt_128) |name, *f| {
++                f.* = try mod.function(name);
++                try f.allowDynamicShared(tc_smem_128);
++            }
++            e.tcgen05 = true;
++        }
+         return e;
+     }
+ 
+@@ -443,6 +463,11 @@ pub const Nvfp4Experts = struct {
+ 
+     /// Prompt rows on a plan of at most `items` items of 64 pairs: up (relu^2 or SwiGLU by the layer), bf16 sums down.
+     pub fn runPrompt(e: *const Nvfp4Experts, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
++        return e.runPromptTile(s, epi, in, l, p, out, items, 64, skip);
++    }
++
++    /// Prompt rows on a plan of `tile`-pair items (64, or 128 on sm_110a tcgen05): up (relu^2/SwiGLU), bf16 sums down.
++    pub fn runPromptTile(e: *const Nvfp4Experts, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, tile: usize, skip: i32) !void {
+         if (epi == .down_f32) return error.EpilogueNotBuilt;
+         const gate = epi == .up;
+         const parts: usize = if (gate and !l.relu2) 2 else 1;
+@@ -460,6 +485,14 @@ pub const Nvfp4Experts = struct {
+         a.add(@as(i32, @intCast(if (gate) l.width else l.dims)));
+         a.add(if (gate) l.limit else @as(f32, 0.0));
+         a.add(skip);
++        if (e.tcgen05 and (!gate or !l.relu2) and (tile == 64 or tile == 128)) {
++            const cb_cta: usize = if (gate) 8 else 16;
++            const fi: usize = if (gate) 0 else 1;
++            const func = if (tile == 128) e.tc_prompt_128[fi] else e.tc_prompt_64[fi];
++            const smem: u32 = if (tile == 128) tc_smem_128 else tc_smem_64;
++            const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(items * ((nb + cb_cta - 1) / cb_cta)), .y = 1, .z = 1 }, .block = .{ .x = 512, .y = 1, .z = 1 }, .shared = smem };
++            return launch_.launch(func, cfg, s, &a);
++        }
+         const fi: usize = if (!gate) 2 else if (l.relu2) 0 else 1;
+         const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(items * ((nb + prompt_wn[fi] - 1) / prompt_wn[fi])), .y = 1, .z = 1 }, .block = .{ .x = @intCast(prompt_wn[fi] * 32), .y = 1, .z = 1 }, .shared = promptSmem(parts, prompt_wn[fi]) };
+         try launch_.launch(e.prompt_fns[fi], cfg, s, &a);
+diff --git a/zig/src/families/glm/cuda_experts.zig b/zig/src/families/glm/cuda_experts.zig
+index f70972f..cfd0c6f 100644
+--- a/zig/src/families/glm/cuda_experts.zig
++++ b/zig/src/families/glm/cuda_experts.zig
+@@ -47,9 +47,16 @@ pub fn wantsBlock32(gpa: std.mem.Allocator, config_json: []const u8) !?cuda.expe
+ /// A grouped plan: the router's arrays, the slots a row holds, the experts; `fact`: decode rows on prompt-sized items.
+ pub const Plan = struct { route: cuda.grouped.Plan, slots: usize, experts: usize, prompt: bool, fact: bool = false };
+ 
+-/// experts.route: `pairs` picks (i32) grouped by expert into the plan's items, 16 pairs a decode item, 64 a prompt one.
++/// Item tile size for a prompt plan: 128 pairs on sm_110a tcgen05 when large enough to halve weight DRAM traffic, else 64.
++fn promptItemTile(ks: *const Kernels, pairs: usize, p: Plan) usize {
++    if (ks.nvfp4.tcgen05 and p.prompt and pairs > p.experts * staged_tile) return 128;
++    return staged_tile;
++}
++
++/// experts.route: `pairs` picks (i32) grouped by expert into the plan's items, 16 pairs a decode item, 64/128 a prompt one.
+ pub fn route(ks: *const Kernels, stream: cuda.Stream, picks: u64, pairs: usize, p: Plan) !void {
+-    return ks.router.route(stream, picks, pairs, p.experts, if (p.prompt or p.fact) staged_tile else tile, p.route);
++    const item_tile: usize = if (p.prompt) promptItemTile(ks, pairs, p) else if (p.fact) staged_tile else tile;
++    return ks.router.route(stream, picks, pairs, p.experts, item_tile, p.route);
+ }
+ 
+ /// nvx.gate_up / down (prompt_* on a prompt plan): `x` rows -> `out` bf16 SwiGLU, fp32 or bf16; `skip` untouched.
+@@ -62,7 +69,10 @@ pub fn run(ks: *const Kernels, stream: cuda.Stream, which: Which, l: cuda.expert
+     };
+     const in: cuda.experts.Rows = .{ .x = x, .stride = x_stride, .slots = plan.slots };
+     const pairs = rows * plan.slots;
+-    if (plan.prompt) return g.prompt(stream, epi, in, l, plan.route, out, maxItems(pairs, plan.experts, staged_tile), pairs, staged_tile, skip);
++    if (plan.prompt) {
++        const pt = promptItemTile(ks, pairs, plan);
++        return g.prompt(stream, epi, in, l, plan.route, out, maxItems(pairs, plan.experts, pt), pairs, pt, skip);
++    }
+     if (plan.fact) {
+         // gate-up reads two matrices a K tile and gains from the factored tiles; down is short and keeps the waves
+         if (epi == .up and !l.relu2) return cuda.experts.Nvfp4Experts.runFact(&ks.nvfp4, stream, epi, in, l, plan.route, out, maxItems(pairs, plan.experts, staged_tile), skip);

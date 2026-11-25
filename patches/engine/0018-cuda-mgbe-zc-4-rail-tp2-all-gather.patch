@@ -1,29 +1,99 @@
-From b685ae6747a3b553222a92c650a76e51f14b810f Mon Sep 17 00:00:00 2001
-From: test <test@thor.local>
-Date: Sun, 22 Nov 2026 21:09:41 -0500
-Subject: [PATCH] cuda: 4-rail /dev/mgbe_zc zero-copy TP=2 all-gather transport
-
----
- zig/src/cuda/abi.zig                         |   39 +
- zig/src/cuda/driver.zig                      |   13 +-
- zig/src/cuda/mgbe_zc.zig                     | 1560 ++++++++++++++++++
- zig/src/cuda/mgbe_zc_uapi.zig                |  111 ++
- zig/src/cuda/root.zig                        |    4 +
- zig/src/cuda/tp_group.zig                    |   17 +-
- zig/src/cuda/tp_watch.zig                    |   14 +-
- zig/src/families/glm/cuda_engine.zig         |    8 +-
- zig/src/families/glm/cuda_forward.zig        |    4 +-
- zig/src/families/glm/cuda_forward_pieces.zig |    1 +
- zig/src/families/glm/cuda_native.zig         |    3 +
- zig/tests/cuda/main.zig                      |    2 +
- zig/tests/cuda/mgbe_zc_gather_tests.zig      |  178 ++
- 13 files changed, 1943 insertions(+), 11 deletions(-)
- create mode 100644 zig/src/cuda/mgbe_zc.zig
- create mode 100644 zig/src/cuda/mgbe_zc_uapi.zig
- create mode 100644 zig/tests/cuda/mgbe_zc_gather_tests.zig
-
+diff --git a/zig/kernels/cuda/roce_gather.cu b/zig/kernels/cuda/roce_gather.cu
+index 302041f..dab3521 100644
+--- a/zig/kernels/cuda/roce_gather.cu
++++ b/zig/kernels/cuda/roce_gather.cu
+@@ -1,5 +1,6 @@
+ // One-shot RoCE all-gather after b12x (github.com/local-inference-lab/b12x, Apache-2.0): docs/roce-gather.md.
+ 
++#include <cuda_bf16.h>
+ #include <stdint.h>
+ 
+ namespace {
+@@ -103,3 +104,82 @@ extern "C" __global__ void __launch_bounds__(512) roce_gather(
+         if (ld_relaxed_sys(ctrl + C_ERROR) == 0u) st_release_gpu(counters + K_EPOCH, seq);
+     }
+ }
++
++// Prefill FP32 partials gathered as BF16 on the wire (half wire bytes): each pack is 8 FP32 (32 B) -> 8 BF16 (16 B).
++extern "C" __global__ void __launch_bounds__(512) roce_gather_bf16(
++    const float4* __restrict__ in, float4* __restrict__ out, int packs, int rank, char* recv, char* flags, char* send,
++    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint32_t spin_limit, int n_hca, int world) {
++    const int tid = threadIdx.x;
++    const int peers = world - 1;
++    uint32_t* stage = counters + 2 + klass;
++    uint32_t* tail = counters + 2 + K_CLASSES + klass;
++    if (ld_relaxed_gpu(counters + K_POISON) != 0u) return;
++    const uint32_t seq = ld_relaxed_gpu(counters + K_EPOCH) + 1u;
++    const uint32_t slot = seq & 1u;
++    const int at = blockIdx.x * blockDim.x + tid, stride = gridDim.x * blockDim.x;
++
++    uint4* mine = reinterpret_cast<uint4*>(send + (long long)slot * slot_bytes);  // 1. stage FP32 -> BF16
++    for (int i = at; i < packs; i += stride) {
++        const float4 f0 = in[2 * i];
++        const float4 f1 = in[2 * i + 1];
++        __nv_bfloat162 b[4];
++        b[0] = __floats2bfloat162_rn(f0.x, f0.y);
++        b[1] = __floats2bfloat162_rn(f0.z, f0.w);
++        b[2] = __floats2bfloat162_rn(f1.x, f1.y);
++        b[3] = __floats2bfloat162_rn(f1.z, f1.w);
++        mine[i] = *reinterpret_cast<const uint4*>(b);
++    }
++    __syncthreads();
++    if (tid == 0) {  // 2. the doorbell, by the last block to stage
++        fence_sys();
++        if ((arrive(stage) + 1u) % gridDim.x == 0u) {
++            st_relaxed_sys(ctrl + C_NBYTES + slot, (uint32_t)packs * 16u);
++            fence_sys();
++            st_relaxed_sys(ctrl + C_SEQ, seq);
++        }
++    }
++    if (tid < peers * n_hca) {  // 3. every peer's stripes: one thread a (peer, HCA) flag
++        const int p = tid / n_hca, h = tid - p * n_hca;
++        const uint32_t* flag = reinterpret_cast<const uint32_t*>(flags + (((long long)slot * peers + p) * n_hca + h) * FLAG_STRIDE);
++        uint32_t polls = 0;
++        while (ld_acquire_sys(flag) != seq) {
++            if (++polls >= spin_limit) {
++                st_relaxed_sys(ctrl + C_HCA, (uint32_t)h);
++                st_relaxed_sys(ctrl + C_PEER, (uint32_t)(p < rank ? p : p + 1));
++                st_relaxed_sys(ctrl + C_ERROR, seq);
++                st_release_gpu(counters + K_POISON, seq);
++                break;
++            }
++        }
++    }
++    __syncthreads();
++    if (ld_relaxed_gpu(counters + K_POISON) == 0u) {  // 4. scatter: own shard stays FP32, peer shards BF16 -> FP32
++        float4* own_out = out + (long long)rank * (2 * packs);
++        const bool copy_own = (own_out != in);
++        for (int i = at; i < packs; i += stride) {
++            if (copy_own) {
++                own_out[2 * i] = in[2 * i];
++                own_out[2 * i + 1] = in[2 * i + 1];
++            }
++            for (int p = 0; p < peers; ++p) {
++                const int r = p < rank ? p : p + 1;
++                const uint4* theirs = reinterpret_cast<const uint4*>(recv + ((long long)slot * peers + p) * slot_bytes);
++                const uint4 v = ld_relaxed_sys4(theirs + i);
++                const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&v);
++                const float2 p0 = __bfloat1622float2(b[0]);
++                const float2 p1 = __bfloat1622float2(b[1]);
++                const float2 p2 = __bfloat1622float2(b[2]);
++                const float2 p3 = __bfloat1622float2(b[3]);
++                float4* dst = out + (long long)r * (2 * packs);
++                dst[2 * i] = make_float4(p0.x, p0.y, p1.x, p1.y);
++                dst[2 * i + 1] = make_float4(p2.x, p2.y, p3.x, p3.y);
++            }
++        }
++    }
++    fence_gpu();  // 5. the epoch, by the last block to finish
++    __syncthreads();
++    if (tid == 0 && (arrive(tail) + 1u) % gridDim.x == 0u) {
++        fence_gpu();
++        if (ld_relaxed_sys(ctrl + C_ERROR) == 0u) st_release_gpu(counters + K_EPOCH, seq);
++    }
++}
 diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
-index 7c7d98a38..c4fbb8976 100644
+index 7c7d98a..c4fbb89 100644
 --- a/zig/src/cuda/abi.zig
 +++ b/zig/src/cuda/abi.zig
 @@ -249,6 +249,45 @@ pub const Api = struct {
@@ -73,7 +143,7 @@ index 7c7d98a38..c4fbb8976 100644
      const std = @import("std");
      std.debug.assert(@sizeOf(LaunchAttribute) == 72 and @offsetOf(LaunchAttribute, "value") == 8);
 diff --git a/zig/src/cuda/driver.zig b/zig/src/cuda/driver.zig
-index 2ee2d530d..7d7ff2594 100644
+index 2ee2d53..7d7ff25 100644
 --- a/zig/src/cuda/driver.zig
 +++ b/zig/src/cuda/driver.zig
 @@ -16,9 +16,20 @@ pub const Driver = struct {
@@ -108,10 +178,10 @@ index 2ee2d530d..7d7ff2594 100644
          if (d.tooOld(&buf)) |why| {
 diff --git a/zig/src/cuda/mgbe_zc.zig b/zig/src/cuda/mgbe_zc.zig
 new file mode 100644
-index 000000000..e5a8126f2
+index 0000000..b6ecdc9
 --- /dev/null
 +++ b/zig/src/cuda/mgbe_zc.zig
-@@ -0,0 +1,1560 @@
+@@ -0,0 +1,1772 @@
 +//! Two-rank TP all-gather over /dev/mgbe_zc (4x25GbE zero-copy MGBE on Jetson AGX Thor).
 +//!
 +//! Reuses kernels.roce_gather on the GPU stream (100% CUDA-Graph capturable) with a 2-slot staging region allocated
@@ -141,7 +211,7 @@ index 000000000..e5a8126f2
 +const threads: u32 = 512;
 +const max_blocks: usize = 8;
 +const idle_spins: u64 = 20_000_000;
-+const spin_limit: u32 = 40_000_000; // ~23s on Thor HOST_NUMA (> 15s worker timeout)
++const spin_limit: u32 = 100_000_000; // ~120s on Thor HOST_NUMA (> 90s arrival + 15s xfer timeouts)
 +const flag_retrans: u8 = 1;
 +
 +const hdr_bytes: usize = 64;
@@ -283,6 +353,11 @@ index 000000000..e5a8126f2
 +    return @as(u64, @max(s, 2)) * 1_000_000_000;
 +}
 +
++fn arrivalTimeoutNsFromEnv(xfer_ns: u64) u64 {
++    const s = envUsize("TF_MGBE_ZC_ARRIVAL_TIMEOUT_S", 90);
++    return @max(xfer_ns, @as(u64, @max(s, 2)) * 1_000_000_000);
++}
++
 +inline fn nowNs() u64 {
 +    var ts: std.c.timespec = undefined;
 +    _ = std.c.clock_gettime(.MONOTONIC, &ts);
@@ -305,6 +380,11 @@ index 000000000..e5a8126f2
 +    dmbOshst();
 +    const p: *volatile u32 = @ptrCast(@alignCast(base + off));
 +    p.* = val;
++}
++
++inline fn mmioRead32(base: [*]volatile u8, off: usize) u32 {
++    const p: *volatile u32 = @ptrCast(@alignCast(base + off));
++    return p.*;
 +}
 +
 +inline fn cacheCleanRange(ptr: [*]const u8, len: usize) void {
@@ -650,7 +730,64 @@ index 000000000..e5a8126f2
 +        q.ringRx();
 +    }
 +
++    fn postDdpDrain(q: *Queue, scratch_iova: u64, npkts: u32) void {
++        const rx = q.rx_ring.?;
++        for (0..npkts) |_| {
++            const idx = q.rx_prod & uapi.ring_mask;
++            cacheInvalRange(q.rx_buf_va + @as(usize, idx) * q.rx_stride, hdr_bytes + 64);
++            const hiova = q.rx_buf_iova + @as(u64, idx) * q.rx_stride;
++            rx[idx].d0 = @truncate(hiova);
++            rx[idx].d1 = @truncate(hiova >> 32);
++            rx[idx].d2 = @truncate(scratch_iova);
++            dmbOshst();
++            @atomicStore(u32, &rx[idx].d3, (@as(u32, @truncate(scratch_iova >> 32)) & 0xFFFF) | uapi.desc_own, .release);
++            q.rx_prod +%= 1;
++        }
++        const tail = q.rx_prod & uapi.ring_mask;
++        rx[tail].d3 = 0;
++        q.ringRx();
++    }
++
 +    const DataComp = struct { hdr: WireHdr, plen: u32, err: bool };
++
++    fn dumpState(q: *const Queue, tag: []const u8) void {
++        const cur_rx = mmioRead32(q.ch_reg, 0x4C);
++        const rdtlp = mmioRead32(q.ch_reg, uapi.ch_rdtlp);
++        const cur_tx = mmioRead32(q.ch_reg, 0x44);
++        const tdtlp = mmioRead32(q.ch_reg, uapi.ch_tdtlp);
++        const status = mmioRead32(q.ch_reg, 0x60);
++        const rx_base_lo: u32 = @truncate(q.rx_ring_iova);
++        const tx_base_lo: u32 = @truncate(q.tx_ring_iova);
++        const hw_rx_idx = (cur_rx -% rx_base_lo) / 16;
++        const hw_rx_tail = (rdtlp -% rx_base_lo) / 16;
++        const hw_tx_idx = (cur_tx -% tx_base_lo) / 16;
++        const hw_tx_tail = (tdtlp -% tx_base_lo) / 16;
++        const rx = q.rx_ring.?;
++        const c = q.rx_cons & uapi.ring_mask;
++        const p = q.rx_prod & uapi.ring_mask;
++        var own0: u32 = 0;
++        var first_own0: i32 = -1;
++        var last_own0: i32 = -1;
++        for (0..uapi.ring_desc_cnt) |i| {
++            if ((@atomicLoad(u32, &rx[i].d3, .acquire) & uapi.desc_own) == 0) {
++                own0 += 1;
++                if (first_own0 < 0) first_own0 = @intCast(i);
++                last_own0 = @intCast(i);
++            }
++        }
++        std.log.err(
++            "mgbe_zc dump [{s} port={d} q={d} ch={d}] status=0x{x} RX(cons={d}({d}) prod={d}({d}) hw_cur={d} hw_tail={d} own0={d} [{d}..{d}]) TX(cons={d} prod={d} hw_cur={d} hw_tail={d}) d3[c-1..c+2]=[0x{x},0x{x},0x{x},0x{x}]",
++            .{
++                tag, q.port, q.qidx, q.hw_chan, status,
++                q.rx_cons, c, q.rx_prod, p, hw_rx_idx, hw_rx_tail, own0, first_own0, last_own0,
++                q.tx_cons, q.tx_prod, hw_tx_idx, hw_tx_tail,
++                rx[(c -% 1) & uapi.ring_mask].d3,
++                rx[c].d3,
++                rx[(c +% 1) & uapi.ring_mask].d3,
++                rx[(c +% 2) & uapi.ring_mask].d3,
++            },
++        );
++    }
 +
 +    fn pollDataRx(q: *Queue) ?DataComp {
 +        const rx = q.rx_ring.?;
@@ -719,6 +856,10 @@ index 000000000..e5a8126f2
 +    stashed_nack_gen: u32 = 0,
 +    has_stashed_nack: bool = false,
 +    peer_max_seq: u32 = 0,
++    in_ddp: bool = false,
++    ddp_seq: u32 = 0,
++    ddp_win_start: u32 = 0,
++    ddp_rx_acked: bool = false,
 +    thread: ?std.Thread = null,
 +    eager_cnt: u64 = 0,
 +    ddp_cnt: u64 = 0,
@@ -782,9 +923,11 @@ index 000000000..e5a8126f2
 +    counters: memory.DeviceBuffer,
 +    module: Module,
 +    f: Function,
++    f_bf16: Function = undefined,
 +    max_bytes: usize,
 +    eager_max: usize,
 +    timeout_ns: u64,
++    arrival_timeout_ns: u64,
 +    debug: bool,
 +    running: std.atomic.Value(bool) = .init(false),
 +    failed: std.atomic.Value(bool) = .init(false),
@@ -866,6 +1009,7 @@ index 000000000..e5a8126f2
 +    }
 +
 +    fn setup(g: *Gather, gpa: std.mem.Allocator, d: *const Driver, rank: u8, max_bytes: usize) !void {
++        const xfer_ns = timeoutNsFromEnv();
 +        g.* = .{
 +            .gpa = gpa,
 +            .d = d,
@@ -877,7 +1021,8 @@ index 000000000..e5a8126f2
 +            .f = undefined,
 +            .max_bytes = max_bytes,
 +            .eager_max = eagerMaxBytesFromEnv(),
-+            .timeout_ns = timeoutNsFromEnv(),
++            .timeout_ns = xfer_ns,
++            .arrival_timeout_ns = arrivalTimeoutNsFromEnv(xfer_ns),
 +            .debug = debugOn(),
 +        };
 +        const fd_rc = std.os.linux.open(uapi.dev_path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
@@ -948,6 +1093,7 @@ index 000000000..e5a8126f2
 +        g.module = try Module.load(d, kernels.roce_gather);
 +        errdefer g.module.unload();
 +        g.f = try g.module.function("roce_gather");
++        g.f_bf16 = try g.module.function("roce_gather_bf16");
 +
 +        errdefer g.teardownRails();
 +        for (0..g.n_ports) |r| {
@@ -1133,7 +1279,14 @@ index 000000000..e5a8126f2
 +            const h = rx.hdr;
 +            const ok = rx.valid;
 +            if (ok) {
-+                if (h.seq != 0 and @as(i32, @bitCast(h.seq -% rl.peer_max_seq)) > 0) rl.peer_max_seq = h.seq;
++                const is_data_op = h.opcode == @intFromEnum(Op.eager) or h.opcode == @intFromEnum(Op.cts) or
++                    h.opcode == @intFromEnum(Op.ack) or h.opcode == @intFromEnum(Op.nack);
++                const seq_ahead: i32 = @bitCast(h.seq -% rl.last_seq);
++                if (is_data_op and h.seq != 0 and seq_ahead > 0 and seq_ahead <= @as(i32, slots) and
++                    @as(i32, @bitCast(h.seq -% rl.peer_max_seq)) > 0)
++                {
++                    rl.peer_max_seq = h.seq;
++                }
 +                switch (h.opcode) {
 +                    @intFromEnum(Op.eager) => {
 +                        const slot: usize = h.seq & 1;
@@ -1180,6 +1333,21 @@ index 000000000..e5a8126f2
 +                        }
 +                    },
 +                    @intFromEnum(Op.ack) => {
++                        if ((h.flags & flag_retrans) != 0 and h.seq != 0) {
++                            const already_acked = (@as(i32, @bitCast(h.seq -% rl.last_seq)) <= 0) or
++                                (rl.in_ddp and h.seq == rl.ddp_seq and (h.win_start < rl.ddp_win_start or
++                                    (h.win_start == rl.ddp_win_start and rl.ddp_rx_acked)));
++                            if (already_acked) {
++                                rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                    .opcode = @intFromEnum(Op.ack),
++                                    .flags = 0,
++                                    .seq = h.seq,
++                                    .win_start = h.win_start,
++                                    .win_pkts = h.win_pkts,
++                                });
++                                rl.retrans_cnt += 1;
++                            }
++                        }
 +                        if (!rl.has_stashed_ack or
 +                            @as(i32, @bitCast(h.seq -% rl.stashed_ack_seq)) > 0 or
 +                            (h.seq == rl.stashed_ack_seq and h.win_start >= rl.stashed_ack_win))
@@ -1259,6 +1427,8 @@ index 000000000..e5a8126f2
 +        rl.eager_tx_hist[slot] = .{ .seq = seq, .nbytes = nbytes, .off = off, .len = len };
 +        g.sendEagerBurst(rl, seq, nbytes, off, len, false);
 +        const t0 = nowNs();
++        var peer_seen = @as(i32, @bitCast(rl.peer_max_seq -% seq)) >= 0;
++        var t_xfer = t0;
 +        var last_tx = t0;
 +        while (g.running.load(.monotonic)) {
 +            g.drainCtrlRx(rl);
@@ -1270,13 +1440,19 @@ index 000000000..e5a8126f2
 +                return;
 +            }
 +            const t = nowNs();
++            if (!peer_seen and @as(i32, @bitCast(rl.peer_max_seq -% seq)) >= 0) {
++                peer_seen = true;
++                t_xfer = t;
++            }
 +            if (t - last_tx >= 500_000) {
 +                g.sendEagerBurst(rl, seq, nbytes, off, len, true);
 +                rl.retrans_cnt += 1;
 +                last_tx = t;
 +            }
-+            if (t - t0 >= g.timeout_ns) {
-+                g.fail("port {d} eager seq {d} ({d} B) timed out (got_seq={d} mask=0x{x}/0x{x})", .{ rl.port, seq, len, es.seq, es.mask, want_mask });
++            const timed_out = if (peer_seen) (t - t_xfer >= g.timeout_ns) else (t - t0 >= g.arrival_timeout_ns);
++            if (timed_out) {
++                rl.ctrl_q.dumpState("ctrl_q");
++                g.fail("port {d} eager seq {d} ({d} B) timed out (got_seq={d} mask=0x{x}/0x{x} peer_max_seq={d} peer_seen={})", .{ rl.port, seq, len, es.seq, es.mask, want_mask, rl.peer_max_seq, peer_seen });
 +                return error.ProxyFailed;
 +            }
 +        }
@@ -1296,9 +1472,17 @@ index 000000000..e5a8126f2
 +
 +        var win_start: u32 = 0;
 +        var cts_gen: u32 = 1;
++        rl.in_ddp = true;
++        rl.ddp_seq = seq;
++        defer {
++            rl.in_ddp = false;
++            rl.ddp_rx_acked = false;
++        }
 +        while (win_start < total_pkts) {
 +            const win_pkts: u32 = @min(bulk_win_max_pkts, total_pkts - win_start);
 +            const win_off = @as(u64, win_start) * max_payload;
++            rl.ddp_win_start = win_start;
++            rl.ddp_rx_acked = false;
 +            // Post our DDP RX window and immediately advertise CTS to peer.
 +            rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
 +            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
@@ -1318,8 +1502,12 @@ index 000000000..e5a8126f2
 +            var rx_skip: u32 = 0;
 +            var rx_gap = false;
 +            var rx_acked = false;
++            var rx_draining = false;
++            var rx_drain_since: u64 = 0;
 +            var peer_cts_gen: u32 = 0;
 +            const t_win = nowNs();
++            var peer_seen = (win_start > 0) or (@as(i32, @bitCast(rl.peer_max_seq -% seq)) >= 0);
++            var t_xfer = t_win;
 +            var last_cts_tx = t_win;
 +            var last_ack_tx: u64 = 0;
 +            var last_rx_activity = t_win;
@@ -1339,7 +1527,11 @@ index 000000000..e5a8126f2
 +                    rl.stashed_cts.valid = false;
 +                }
 +                if (rl.has_stashed_ack and rl.stashed_ack_seq == seq and rl.stashed_ack_win == win_start) {
-+                    tx_acked = true;
++                    if (tx_sent == win_pkts) {
++                        tx_acked = true;
++                    } else {
++                        std.log.warn("mgbe_zc port {d} seq {d}: ignoring premature ACK (tx_sent={d}/{d} tx_allowed={})", .{ rl.port, seq, tx_sent, win_pkts, tx_allowed });
++                    }
 +                    rl.has_stashed_ack = false;
 +                }
 +                if (rl.has_stashed_nack and rl.stashed_nack_seq == seq and rl.stashed_nack_win == win_start) {
@@ -1354,7 +1546,7 @@ index 000000000..e5a8126f2
 +                    }
 +                    rl.has_stashed_nack = false;
 +                }
-+                if (!tx_acked and (@as(i32, @bitCast(rl.peer_max_seq -% seq)) > 0 or
++                if (!tx_acked and tx_sent == win_pkts and (@as(i32, @bitCast(rl.peer_max_seq -% seq)) > 0 or
 +                    (rl.stashed_cts.valid and rl.stashed_cts.seq == seq and rl.stashed_cts.win_start > win_start)))
 +                {
 +                    tx_acked = true;
@@ -1414,51 +1606,88 @@ index 000000000..e5a8126f2
 +
 +                // Poll RX DDP completions
 +                var drained_any = false;
-+                while (!rx_acked and (rx_skip > 0 or rx_got < win_pkts)) {
-+                    const comp = rl.data_q.pollDataRx() orelse break;
-+                    drained_any = true;
-+                    last_rx_activity = nowNs();
-+                    if (rx_skip > 0) {
-+                        rx_skip -= 1;
-+                        continue;
++                if (rx_draining) {
++                    while (rl.data_q.pollDataRx()) |_| {
++                        drained_any = true;
++                        rx_drain_since = nowNs();
++                        last_rx_activity = rx_drain_since;
 +                    }
-+                    if (comp.err or comp.hdr.seq != seq or comp.hdr.win_start != win_start or comp.hdr.psn != rx_got) {
-+                        rx_gap = true;
++                    const avail: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                    if (avail < 32 and avail + 64 + win_pkts < uapi.ring_desc_cnt - 16) {
++                        rl.data_q.postDdpDrain(recv_iova + win_off, 64);
 +                    }
-+                    rx_got += 1;
-+                }
-+                if (!rx_acked and rx_skip == 0 and rx_got == win_pkts) {
-+                    if (!rx_gap) {
-+                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
-+                            .opcode = @intFromEnum(Op.ack),
-+                            .seq = seq,
-+                            .win_start = win_start,
-+                            .win_pkts = @intCast(win_pkts),
-+                        });
-+                        rx_acked = true;
-+                        last_ack_tx = nowNs();
-+                    } else {
-+                        // Clean Go-Back-N recovery: 0 leftover descriptors, post fresh window and request resend.
-+                        rx_got = 0;
-+                        rx_gap = false;
-+                        cts_gen +%= 1;
-+                        rl.retrans_cnt += 1;
-+                        rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
-+                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
-+                            .opcode = @intFromEnum(Op.nack),
-+                            .seq = seq,
-+                            .win_start = win_start,
-+                            .win_pkts = 0,
-+                            .cts_gen = cts_gen,
-+                        });
++                    const t_d = nowNs();
++                    if ((t_d - rx_drain_since) >= 1_000_000) {
++                        // Wire has been quiet for 1 ms: post a fresh aligned window behind the remaining drain descriptors.
++                        const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                        if (rem + win_pkts < uapi.ring_desc_cnt - 16) {
++                            rx_draining = false;
++                            rx_skip = rem;
++                            rx_got = 0;
++                            rx_gap = false;
++                            cts_gen +%= 1;
++                            rl.retrans_cnt += 1;
++                            rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
++                            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                .opcode = @intFromEnum(Op.nack),
++                                .seq = seq,
++                                .win_start = win_start,
++                                .win_pkts = @intCast(rem),
++                                .cts_gen = cts_gen,
++                            });
++                            last_rx_activity = t_d;
++                        }
++                    }
++                } else {
++                    while (!rx_acked and (rx_skip > 0 or rx_got < win_pkts)) {
++                        const comp = rl.data_q.pollDataRx() orelse break;
++                        drained_any = true;
 +                        last_rx_activity = nowNs();
++                        if (rx_skip > 0) {
++                            rx_skip -= 1;
++                            continue;
++                        }
++                        if (comp.err or comp.hdr.seq != seq or comp.hdr.win_start != win_start or comp.hdr.cts_gen != cts_gen or comp.hdr.psn != rx_got) {
++                            rx_gap = true;
++                        }
++                        rx_got += 1;
++                    }
++                    if (!rx_acked and rx_skip == 0 and rx_got == win_pkts) {
++                        if (!rx_gap) {
++                            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                .opcode = @intFromEnum(Op.ack),
++                                .seq = seq,
++                                .win_start = win_start,
++                                .win_pkts = @intCast(win_pkts),
++                            });
++                            rx_acked = true;
++                            rl.ddp_rx_acked = true;
++                            last_ack_tx = nowNs();
++                        } else {
++                            // Misaligned/gap window: quiesce any still-in-flight trailing packets into drain descriptors
++                            // before posting the next aligned window + NACK, preventing phase-shift livelock.
++                            rx_draining = true;
++                            rx_drain_since = nowNs();
++                            rx_got = 0;
++                            rx_gap = false;
++                            if (rl.data_q.rx_prod -% rl.data_q.rx_cons + 64 + win_pkts < uapi.ring_desc_cnt - 16) {
++                                rl.data_q.postDdpDrain(recv_iova + win_off, 64);
++                            }
++                            last_rx_activity = rx_drain_since;
++                        }
 +                    }
 +                }
 +
 +                const t = nowNs();
++                if (!peer_seen and @as(i32, @bitCast(rl.peer_max_seq -% seq)) >= 0) {
++                    peer_seen = true;
++                    t_xfer = t;
++                    last_rx_activity = t;
++                }
 +                if (rx_acked and !tx_acked and (t - last_ack_tx) >= 2_000_000) {
 +                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
 +                        .opcode = @intFromEnum(Op.ack),
++                        .flags = flag_retrans,
 +                        .seq = seq,
 +                        .win_start = win_start,
 +                        .win_pkts = @intCast(win_pkts),
@@ -1466,22 +1695,13 @@ index 000000000..e5a8126f2
 +                    last_ack_tx = t;
 +                }
 +                // Re-send our CTS while peer hasn't delivered any packet for our RX window yet (independent of tx_allowed!).
-+                if (!rx_acked and rx_skip == 0 and rx_got == 0 and (t - last_cts_tx) >= 1_000_000) {
-+                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
-+                        .opcode = @intFromEnum(Op.cts),
-+                        .seq = seq,
-+                        .win_start = win_start,
-+                        .win_pkts = @intCast(win_pkts),
-+                        .nbytes = nbytes,
-+                        .cts_gen = cts_gen,
-+                    });
-+                    last_cts_tx = t;
-+                }
-+                // Partial RX window stalled (a packet dropped on the wire): post a fresh aligned window behind the
-+                // `rem` leftover descriptors and ask peer to flush `rem` short frames then resend the window.
-+                if (!rx_acked and (rx_skip > 0 or (rx_got > 0 and rx_got < win_pkts)) and !drained_any and (t - last_rx_activity) >= 5_000_000) {
-+                    const rem: u32 = rx_skip + (win_pkts - rx_got);
-+                    if (rl.data_q.rx_prod -% rl.data_q.rx_cons + win_pkts < uapi.ring_desc_cnt - 16) {
++                if (!rx_acked and !rx_draining and rx_skip == 0 and rx_got == 0 and (t - last_cts_tx) >= 1_000_000) {
++                    // If peer is already at >= seq and we received 0 packets for 50ms, handle total-loss window by
++                    // posting a fresh aligned DDP RX window behind the leftover descriptors and sending NACK with a new cts_gen.
++                    const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                    if (@as(i32, @bitCast(rl.peer_max_seq -% seq)) >= 0 and (t - last_rx_activity) >= 50_000_000 and
++                        rem + win_pkts < uapi.ring_desc_cnt - 16)
++                    {
 +                        rx_skip = rem;
 +                        rx_got = 0;
 +                        rx_gap = false;
@@ -1495,11 +1715,55 @@ index 000000000..e5a8126f2
 +                            .win_pkts = @intCast(rem),
 +                            .cts_gen = cts_gen,
 +                        });
++                        last_rx_activity = t;
++                        last_cts_tx = t;
++                    } else {
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.cts),
++                            .seq = seq,
++                            .win_start = win_start,
++                            .win_pkts = @intCast(win_pkts),
++                            .nbytes = nbytes,
++                            .cts_gen = cts_gen,
++                        });
++                        last_cts_tx = t;
++                    }
++                }
++                // Partial RX window stalled (a packet dropped on the wire): post a fresh aligned window behind the
++                // `rem` leftover descriptors and ask peer to flush `rem` short frames then resend the window.
++                if (!rx_acked and !rx_draining and (rx_skip > 0 or (rx_got > 0 and rx_got < win_pkts)) and !drained_any and (t - last_rx_activity) >= 5_000_000) {
++                    const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                    if (rem + win_pkts < uapi.ring_desc_cnt - 16) {
++                        rx_skip = rem;
++                        rx_got = 0;
++                        rx_gap = false;
++                        cts_gen +%= 1;
++                        rl.retrans_cnt += 1;
++                        rl.data_q.postDdpRx(recv_iova + win_off, win_pkts);
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.nack),
++                            .seq = seq,
++                            .win_start = win_start,
++                            .win_pkts = @intCast(rem),
++                            .cts_gen = cts_gen,
++                        });
++                    } else if (rx_skip > 0 and rx_got == 0) {
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.nack),
++                            .seq = seq,
++                            .win_start = win_start,
++                            .win_pkts = @intCast(rx_skip),
++                            .cts_gen = cts_gen,
++                        });
 +                    }
 +                    last_rx_activity = t;
 +                }
-+                if (t - t_win >= g.timeout_ns) {
-+                    g.fail("port {d} DDP seq {d} win {d} timed out (rx={d}/{d} skip={d} ack_rx={} tx={d}/{d} ack_tx={})", .{ rl.port, seq, win_start, rx_got, win_pkts, rx_skip, rx_acked, tx_sent, win_pkts, tx_acked });
++                const timed_out = if (peer_seen) (t - t_xfer >= g.timeout_ns) else (t - t_win >= g.arrival_timeout_ns);
++                if (timed_out) {
++                    std.log.err("mgbe_zc timeout port {d} DDP seq {d} win {d} (rx={d}/{d} skip={d} drain={} ack_rx={} tx={d}/{d} ack_tx={} peer_max_seq={d} peer_seen={} retrans={d})", .{ rl.port, seq, win_start, rx_got, win_pkts, rx_skip, rx_draining, rx_acked, tx_sent, win_pkts, tx_acked, rl.peer_max_seq, peer_seen, rl.retrans_cnt });
++                    rl.ctrl_q.dumpState("ctrl_q");
++                    rl.data_q.dumpState("data_q");
++                    g.fail("port {d} DDP seq {d} win {d} timed out (rx={d}/{d} skip={d} drain={} ack_rx={} tx={d}/{d} ack_tx={} peer_max_seq={d} peer_seen={} retrans={d})", .{ rl.port, seq, win_start, rx_got, win_pkts, rx_skip, rx_draining, rx_acked, tx_sent, win_pkts, tx_acked, rl.peer_max_seq, peer_seen, rl.retrans_cnt });
 +                    return error.ProxyFailed;
 +                }
 +            }
@@ -1557,6 +1821,12 @@ index 000000000..e5a8126f2
 +                    @atomicStore(u32, &c[c_hca], rl.port, .release);
 +                    @atomicStore(u32, &c[c_error], s, .release);
 +                    g.failed.store(true, .release);
++                    // Keep draining ctrl_q until teardown so peer retries never back up the MAC RX FIFO
++                    // (which would otherwise starve VDMA 0/1 TCP/liveness/SSH on the shared port).
++                    while (g.running.load(.monotonic)) {
++                        while (rl.ctrl_q.peekCtrl()) |_| rl.ctrl_q.consumeCtrl();
++                        nap.pause();
++                    }
 +                    return;
 +                };
 +                rl.last_seq = s;
@@ -1568,10 +1838,22 @@ index 000000000..e5a8126f2
 +        return bytes > 0 and bytes <= g.max_bytes and bytes % 16 == 0;
 +    }
 +
++    pub fn fitsBf16(g: *const Gather, fp32_bytes: usize) bool {
++        return fp32_bytes > 0 and (fp32_bytes / 2) <= g.max_bytes and fp32_bytes % 32 == 0;
++    }
++
 +    /// Launches kernels.roce_gather on `stream` (CUDA-Graph capturable).
 +    pub fn gather(g: *Gather, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize) !void {
++        try g.launchGather(g.f, stream, send, recv, bytes / 16);
++    }
++
++    /// Launches kernels.roce_gather_bf16 on `stream`: gathers FP32 shards as BF16 on the wire (half wire bytes).
++    pub fn gatherFp32AsBf16(g: *Gather, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, fp32_bytes: usize) !void {
++        try g.launchGather(g.f_bf16, stream, send, recv, fp32_bytes / 32);
++    }
++
++    fn launchGather(g: *Gather, f: Function, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, packs: usize) !void {
 +        if (send % 16 != 0 or recv % 16 != 0) return error.Misaligned;
-+        const packs = bytes / 16;
 +        const need = @max(1, std.math.divCeil(usize, packs, 2 * threads) catch unreachable);
 +        const grid: u32 = @intCast(@min(std.math.ceilPowerOfTwo(usize, need) catch max_blocks, max_blocks));
 +        const klass: i32 = @intCast(std.math.log2_int(u32, grid));
@@ -1591,7 +1873,7 @@ index 000000000..e5a8126f2
 +        a.add(spin_limit);
 +        a.add(@as(i32, @intCast(g.n_ports)));
 +        a.add(@as(i32, 2));
-+        try launch.launch(g.f, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = g.d }, &a);
++        try launch.launch(f, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = g.d }, &a);
 +        g.gathers += 1;
 +    }
 +
@@ -1674,7 +1956,7 @@ index 000000000..e5a8126f2
 +}
 diff --git a/zig/src/cuda/mgbe_zc_uapi.zig b/zig/src/cuda/mgbe_zc_uapi.zig
 new file mode 100644
-index 000000000..34c6c409b
+index 0000000..34c6c40
 --- /dev/null
 +++ b/zig/src/cuda/mgbe_zc_uapi.zig
 @@ -0,0 +1,111 @@
@@ -1790,7 +2072,7 @@ index 000000000..34c6c409b
 +    std.debug.assert(@offsetOf(MrReq, "iova") == 48);
 +}
 diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
-index b6476817f..ae6ffa602 100644
+index b647681..ae6ffa6 100644
 --- a/zig/src/cuda/root.zig
 +++ b/zig/src/cuda/root.zig
 @@ -31,6 +31,8 @@ pub const graph = @import("graph.zig");
@@ -1812,7 +2094,7 @@ index b6476817f..ae6ffa602 100644
      _ = @import("relay_plan.zig");
      _ = launch;
 diff --git a/zig/src/cuda/tp_group.zig b/zig/src/cuda/tp_group.zig
-index 147b046ee..b588fa017 100644
+index 147b046..b588fa0 100644
 --- a/zig/src/cuda/tp_group.zig
 +++ b/zig/src/cuda/tp_group.zig
 @@ -5,6 +5,7 @@ const driver = @import("driver.zig");
@@ -1879,7 +2161,7 @@ index 147b046ee..b588fa017 100644
          try g.call(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, s.handle), "ncclAllGather");
      }
 diff --git a/zig/src/cuda/tp_watch.zig b/zig/src/cuda/tp_watch.zig
-index 9f55dc15a..2540f19fa 100644
+index 9f55dc1..2540f19 100644
 --- a/zig/src/cuda/tp_watch.zig
 +++ b/zig/src/cuda/tp_watch.zig
 @@ -55,14 +55,14 @@ pub fn explain(e: anyerror) ?[]const u8 {
@@ -1933,7 +2215,7 @@ index 9f55dc15a..2540f19fa 100644
      stop();
  }
 diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
-index 4c430e012..6c2522c5e 100644
+index 4c430e0..6c2522c 100644
 --- a/zig/src/families/glm/cuda_engine.zig
 +++ b/zig/src/families/glm/cuda_engine.zig
 @@ -288,11 +288,15 @@ pub const Engine = struct {
@@ -1955,7 +2237,7 @@ index 4c430e012..6c2522c5e 100644
  
      pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
 diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
-index 5a6f0247d..62c065a6e 100644
+index 5a6f024..62c065a 100644
 --- a/zig/src/families/glm/cuda_forward.zig
 +++ b/zig/src/families/glm/cuda_forward.zig
 @@ -125,8 +125,8 @@ pub const Pieces = pieces_mod.Pieces;
@@ -1970,19 +2252,41 @@ index 5a6f0247d..62c065a6e 100644
  
  /// One rank of the forward: its weights, its sequence's caches, the window's buffers.
 diff --git a/zig/src/families/glm/cuda_forward_pieces.zig b/zig/src/families/glm/cuda_forward_pieces.zig
-index c713c513f..04e99f19c 100644
+index c713c51..6769e9a 100644
 --- a/zig/src/families/glm/cuda_forward_pieces.zig
 +++ b/zig/src/families/glm/cuda_forward_pieces.zig
-@@ -181,6 +181,7 @@ pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split:
+@@ -1,4 +1,5 @@
+ //! The existing pieced prompt exchanges, isolated so their diagnostic spans stay beside each stream operation.
++const std = @import("std");
+ const cuda = @import("cuda");
+ const relay = @import("cuda_relay.zig");
+ const taps = @import("cuda_taps.zig");
+@@ -168,6 +169,12 @@ pub fn shareTaps(f: *const Forward, t: taps.Taps, cut: []const [2]usize) !void {
+     }
+ }
+ 
++fn zcPrefillBf16() bool {
++    const v = std.c.getenv("TF_MGBE_ZC_PREFILL_BF16") orelse return true;
++    const t = std.mem.span(v);
++    return !(t.len == 0 or std.mem.eql(u8, t, "0"));
++}
++
+ /// A piece's partials on the side stream: gathered whole, or split (each rank's rows of every partial to their owner).
+ pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split: bool) !void {
+     const D = f.ranks[0].w.config.hidden;
+@@ -181,6 +188,10 @@ pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split:
          },
          .nccl => |x| {
              const r = f.ranks[0];
-+            if (x.group) |g| if (g.zc) |z| if (z.fits(bytes)) return z.gather(p.side.handle, room(r, lo) + r.w.share.rank * bytes, room(r, lo), bytes);
++            if (x.group) |g| if (g.zc) |z| {
++                if (zcPrefillBf16() and z.fitsBf16(bytes)) return z.gatherFp32AsBf16(p.side.handle, room(r, lo) + r.w.share.rank * bytes, room(r, lo), bytes);
++                if (z.fits(bytes)) return z.gather(p.side.handle, room(r, lo) + r.w.share.rank * bytes, room(r, lo), bytes);
++            };
              try x.lib.check(x.lib.api.ncclAllGather(room(r, lo) + r.w.share.rank * bytes, room(r, lo), n * D, .f32, x.comm, p.side.handle), "ncclAllGather");
          },
      } else switch (f.exchange) {
 diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
-index b8eada986..e00e109e1 100644
+index b8eada9..e00e109 100644
 --- a/zig/src/families/glm/cuda_native.zig
 +++ b/zig/src/families/glm/cuda_native.zig
 @@ -333,6 +333,9 @@ fn finishRank(a: OpenArgs) !Loaded {
@@ -1996,7 +2300,7 @@ index b8eada986..e00e109e1 100644
      errdefer if (own.group.multi) |m| m.deinit(m.ctx);
      own.e.installGroup(&own.group);
 diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
-index 8f7bf72a1..2d6ee6524 100644
+index 8f7bf72..2d6ee65 100644
 --- a/zig/tests/cuda/main.zig
 +++ b/zig/tests/cuda/main.zig
 @@ -12,6 +12,7 @@ const oracle_tests = @import("oracle_tests.zig");
@@ -2017,7 +2321,7 @@ index 8f7bf72a1..2d6ee6524 100644
      if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
 diff --git a/zig/tests/cuda/mgbe_zc_gather_tests.zig b/zig/tests/cuda/mgbe_zc_gather_tests.zig
 new file mode 100644
-index 000000000..8cf839934
+index 0000000..8cf8399
 --- /dev/null
 +++ b/zig/tests/cuda/mgbe_zc_gather_tests.zig
 @@ -0,0 +1,178 @@
@@ -2199,6 +2503,3 @@ index 000000000..8cf839934
 +    }
 +    check.pass("mgbe-zc-gather rank {d}: CUDA Graph ({d} gathers x {d} replays) bit-exact", .{ rank, graph_gathers, graph_replays });
 +}
--- 
-2.43.0
-

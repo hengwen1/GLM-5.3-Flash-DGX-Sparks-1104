@@ -11,9 +11,11 @@ communication.
 | --- | --- | --- |
 | GPU compute capability | `12.1` → `SM=121` | `11.0` → `SM=110a` |
 | EXL3 prompt kernel | `mma.sync` | `tcgen05` 5th-gen tensor core + TMEM (`sm_110a`, patch `0019`) |
-| EXL3 grouped decode load | `AHEAD` (`__CUDA_ARCH__ >= 1200`) | `AHEAD` (`__CUDA_ARCH__ >= 1100`, patch `0017`) |
+| EXL3 grouped decode load | `AHEAD` (`__CUDA_ARCH__ >= 1200`) | `AHEAD` (`__CUDA_ARCH__ >= 1100`, patch `0019`) |
+| NVFP4 MoE prompt kernel | `mma.sync` (`TPM=64`) | `tcgen05` 5th-gen tensor core (`TPM=64/128`, 512 TMEM cols, patch `0021`) |
+| MLA attention kernel | `mma.sync` (`KT=32`) | `tcgen05` 5th-gen tensor core (`KT=128`, patch `0020`) |
 | Interconnect | ConnectX-7 RoCE (`libibverbs`) | 4 × 25 GbE MGBE Ethernet (`mgbe0_0..mgbe3_0`, MTU 9000) |
-| Engine TP=2 all-gather | `roce.zig` (`TF_ROCE=1`) | `/dev/mgbe_zc` 4-rail zero-copy (`TF_MGBE_ZC=1`, patch `0018`) |
+| Engine TP=2 all-gather | `roce.zig` (`TF_ROCE=1`) | `/dev/mgbe_zc` 4-rail zero-copy + BF16 prefill (`TF_MGBE_ZC=1`, patch `0018`) |
 | NCCL fallback / bootstrap | IB verbs | Socket (TCP) across all 4 MGBE rails (`NCCL_IB_DISABLE=1`) |
 | Docker GPU passthrough | `--gpus all` | `--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all` |
 | CUDA runtime floor | `cuda>=13.3` | Relaxed automatically to host driver CUDA (`13.2` on JetPack 7.2) |
@@ -75,7 +77,7 @@ flowchart TB
 3. **Zero-copy device wiring (`scripts/prepare.sh`, `start.sh`)**: When `MGBE_ZC=auto` (or `on`) and `/dev/mgbe_zc` exists on both nodes, resolves `MGBE_ZC_PORTS` (`0,1,2,3`), looks up the `mgbe_zc` group GID on each host, passes `--device /dev/mgbe_zc --group-add <gid>`, and exports `TF_MGBE_ZC=1`, `TF_MGBE_ZC_MAX_KB=16384`, `TF_MGBE_ZC_EAGER_KB=32`, `TF_MGBE_ZC_PORTS`, and `TF_GLM_PREFILL_REDUCE=gather` (so prefill exchanges use 4-rail DDP all-gather).
 4. **GPU runtime & CUDA floor**: `GPU_RUNTIME=auto` selects `--runtime=nvidia` and relaxes `NVIDIA_REQUIRE_CUDA` when JetPack's driver reports an older minor CUDA version than the container base image.
 
-### 3. Engine dataplane (`zig/src/cuda/mgbe_zc.zig`, patches `0018` & `0020`)
+### 3. Engine dataplane (`zig/src/cuda/mgbe_zc.zig`, patch `0018`)
 - **Initialization & probe**: `tp_group.Group.openMgbeZc()` allocates the 2-slot `CU_MEM_LOCATION_TYPE_HOST_NUMA` staging region, exchanges MACs over NCCL, runs a bidirectional `ctrl` + `SPH=1` DDP wire probe on every rail, and spawns one `railWorker` thread per port. If either rank fails probe, both fall back cleanly to NCCL Socket TCP.
 - **GPU stream interface**: `allGather()` launches `kernels.roce_gather` on the CUDA stream (100% CUDA-Graph capturable). The kernel stages `send[slot]`, rings the `ctrl.seq` doorbell, polls per-rail completion flags in `HOST_NUMA`, and scatters `recv[slot]` into the output tensor.
 - **Dual-path transport**:
@@ -164,35 +166,26 @@ ls -l /dev/mgbe_zc   # crw-rw---- 1 root mgbe_zc
 ./tests/zc_hw_selftest --ports 0,1,2,3
 ```
 
-## Engine patches for Thor (`0017`–`0023`)
+## Engine patches for Thor (`0017`–`0021`)
 
-- **`0017-glm-cuda-sm110a-exl3-ahead-and-TF_GLM_MM_CUBLAS.patch`**:
-  - Enables `GROUPED_LOAD = tf_exl3::AHEAD` for `__CUDA_ARCH__ >= 1100` in `exl3_experts.cu`.
+- **`0017-glm-cuda-sm110a-cublaslt-prompt-and-lru-cache.patch`**:
   - Adds `-gencode=arch=compute_110,code=sm_110` to `mailbox.cu` fatbin.
-  - Ports opt-in `TF_GLM_MM_CUBLAS=1` (off by default, `TF_GLM_MM_CUBLAS_MIN_ROWS=128`) with 1:1 `plain_keys`/`plain_vals`
-    tracking (fixing mixed `head_bits=16` / `dense_bits=8` lookup alignment) and per-stream cuBLASLt workspaces.
+  - Ports opt-in `TF_GLM_MM_CUBLAS=1` (`TF_GLM_MM_CUBLAS_MIN_ROWS=128`) with 1:1 `plain_keys`/`plain_vals` tracking (fixing mixed `head_bits=16` / `dense_bits=8` lookup alignment) and per-stream cuBLASLt workspaces.
+  - Routes prompt-chunk (`rows >= 64`) `absorbQ` and `expandV` through `cuBLASLt` strided batched BF16 GEMM (`cuda_mm.zig` / `cuda_latent.zig`, zero extra VRAM, decode windows untouched), cutting 11-layer absorb+expand from ~589 ms to ~20 ms per 4,096-row pass.
+  - Uses a single shared `cublasLtHandle_t` (`cuda.cublaslt.Gemm`) with **LRU plan cache eviction** (512 linear / 256 batched slots) so varied prompt lengths never hit `error.TooManyPlans`.
 - **`0018-cuda-mgbe-zc-4-rail-tp2-all-gather.patch`**:
   - Implements `zig/src/cuda/mgbe_zc.zig` + `mgbe_zc_uapi.zig`, wired into `tp_group.Group` and `cuda_forward_pieces.zig`.
-  - Allocates the 2-slot staging region via CUDA VMM `CU_MEM_LOCATION_TYPE_HOST_NUMA` (directly accessible by GPU
-    `roce_gather` kernels and `/dev/mgbe_zc` `FOLL_LONGTERM` contiguous 48-bit SMMU DMA).
-  - Reuses `kernels.roce_gather` on the CUDA stream so decode/verify all-gathers are **100% CUDA-Graph capturable**.
-  - Uses 0.5-RTT raw L2 eager frames for small/decode stripes (`<= 32 KiB/rail`) and hardware split-header DDP (`SPH=1`,
-    8 KiB payload landing directly into CUDA `HOST_NUMA`) for bulk/prefill stripes (`<= 16 MiB/rank`).
+  - Allocates the 2-slot staging region via CUDA VMM `CU_MEM_LOCATION_TYPE_HOST_NUMA` (directly accessible by GPU `roce_gather` kernels and `/dev/mgbe_zc` `FOLL_LONGTERM` contiguous 48-bit SMMU DMA) so decode/verify all-gathers are **100% CUDA-Graph capturable**.
+  - Uses 0.5-RTT raw L2 eager frames for small/decode stripes (`<= 32 KiB/rail`) and hardware split-header DDP (`SPH=1`, 8 KiB payload landing directly into CUDA `HOST_NUMA`) for bulk/prefill stripes (`<= 16 MiB/rank`), including `flag_retrans` post-exit `Op.ack` replies, `tx_sent == win_pkts` guards, bounded `peer_max_seq`, 50 ms total-loss DDP window recovery, quiesced RX gap draining, and separate peer-arrival timeout.
+  - Adds **BF16 prefill all-gather partials** (`roce_gather_bf16` in `roce_gather.cu`, `gatherFp32AsBf16` in `mgbe_zc.zig`, `TF_MGBE_ZC_PREFILL_BF16=0` off switch) to halve prefill interconnect payload over 4×25 GbE.
 - **`0019-exl3-cuda-sm110a-tcgen05-prompt-kernel.patch`**:
-  - Implements `tmain_tcgen05` + `tspill_tcgen05` in `zig/kernels/cuda/exl3_prompt.cuh` and `exl3_experts.cu`, gated on
-    `__CUDA_ARCH__ == 1100 && defined(__CUDA_ARCH_FEAT_SM110_ALL)` (`sm_110a` only).
-  - Maps EXL3 MCG `decode_tile_p` (`K2=8` 4-bit and `K2=6` 3-bit) directly into canonical 8×8 core matrices with zero
-    shuffles and zero shared-memory bank conflicts (`lane == rl * 4 + kp`), stages `X` directly into canonical core
-    matrices via `cp.async`, accumulates two `128×64` FP32 tiles in 128 TMEM columns via `tcgen05.mma.cta_group::1.kind::f16`,
-    and spills via dual-warpgroup `tcgen05.ld.sync.aligned.32x32b.x16.b32` into the existing `fwht128` + SwiGLU epilogue.
-  - Fits inside the existing static shared memory footprint (`43.3 KiB`, 52–58 registers/thread, 0 spill bytes).
-- **`0020-cuda-mgbe-zc-reack-and-total-loss-ddp-recovery.patch`**:
-  - Fixes lost final `Op.ack` deadlock in `runDdp()` via `flag_retrans` post-exit `Op.ack` replies in `drainCtrlRx()`.
-  - Guards `tx_acked = true` with `tx_sent == win_pkts` and bounds `peer_max_seq` updates to data opcodes within `1..slots` ahead of `last_seq`.
-  - Adds 50 ms total-loss DDP window recovery (`Op.nack` with bumped `cts_gen`), keeps draining `ctrl_q` on worker error to prevent MAC RX FIFO overflow from starving `VDMA 0/1` TCP/liveness, and logs `ctrl_q`/`data_q` DMA registers on timeout.
-- **`0023-glm-cuda-sm110a-tcgen05-mla-and-cublas-absorb.patch`**:
+  - Enables `GROUPED_LOAD = tf_exl3::AHEAD` for `__CUDA_ARCH__ >= 1100` in `exl3_experts.cu`.
+  - Implements `tmain_tcgen05` + `tspill_tcgen05` in `zig/kernels/cuda/exl3_prompt.cuh`, `exl3_experts.cu`, and `exl3_prompt.zig` (gated on `sm_110a`), upgrading to `TPM=128` (`M=128, N=128`, 256 TMEM columns, 0 register spills).
+- **`0020-glm-cuda-sm110a-tcgen05-mla.patch`**:
   - Adds `chunks_32_tcgen05` in `zig/kernels/cuda/common/mla.cuh` (gated on `sm_110a`, `KT=128`, `M=128, N=32` `tcgen05.mma.cta_group::1.kind::f16` for both `QK^T` K-major and `PV` MN-major with `SWIZZLE_128B`, 128 TMEM columns, 0 register spills, 1-warp-per-key coalesced 16-byte FP8 loads, 8-warp parallel online softmax) with `sm_110`-only `193,536 B` dynamic SMEM in `cuda_glue.zig` / `cuda_latent.zig`.
-  - Routes prompt-chunk (`rows >= 64`) `absorbQ` and `expandV` through `cuBLASLt` strided batched BF16 GEMM (`cuda_mm.zig` / `cuda_latent.zig`, gated on `TF_GLM_MM_CUBLAS=1`, zero extra VRAM, decode windows untouched), cutting 11-layer absorb+expand from ~589 ms to ~20 ms per 4,096-row pass.
+- **`0021-glm-cuda-sm110a-tcgen05-nvfp4-experts.patch`**:
+  - Adds `sm_110a` `tcgen05` NVFP4 MoE prompt kernels (`tf_nvfp4_prompt_{swiglu,down}_tcgen05_{64,128}`) in `nvfp4_experts.cu`, `experts.zig`, and `cuda_experts.zig` (`TF_NVFP4_TCGEN05=0` off switch; `sm_121` untouched).
+  - Uses all 512 TMEM columns (`4 × 128×128` BF16 `tcgen05.mma` tiles), 16 warps (512 threads), double-buffered `A` (64 KiB), and a 6-stage `cp.async` ring (`169,984 B` SMEM for `TPM=128`), dynamically routing large prompt chunks (`pairs > experts × 64`) to 128-pair items (`100.00%` bit-exact BF16 vs `tf_nvfp4_prompt_*`, `32.88 → 20.36 ms/layer`).
 
 ## Measured kernel & transport gates on 2× Jetson AGX Thor
 
@@ -232,8 +225,9 @@ Measured greedy (`temperature=0`, `enable_thinking=false`, fresh prompts, `0` ne
 | 4-stream decode (4 × 256 tok) | **38.9–46.7 tok/s agg** (12.8–13.2 tok/s/stream) | 21.9–26.4 s wall |
 | Cold ~4K prefill (3,948 tok) | **488.9 tok/s** (TTFT 8.08 s) | `TF_GLM_MM_CUBLAS=0`, 2048-row passes |
 | Cold ~8K prefill (8,429 tok) | **479.2 tok/s** (TTFT 17.59 s) | Exact retrieval, 0 RX FIFO overflows, stays healthy |
-| Cold 16K–170K prefill sweep (15.7K / 28.7K / 57.2K / 112.6K / 170.8K + 14-stream concurrent batch) | **~510 tok/s prefill**, **31.4–36.5 tok/s** decode (TTFT 29.9 s / 56.5 s / 111.2 s / 219.9 s / 336.0 s) | Patch `0020`, 4 rails (`0,1,2,3`), `TF_GLM_MM_CUBLAS=0`, 2048-row passes |
-| Cold ~4K / ~10K / ~24K prefill (`GLM_MM_CUBLAS=1`, `TF_GLM_CHUNK_SOLO=4096`, `TF_GLM_OVERLAP_PIECES=8`, patch `0023`) | **626.3 / 659.4 / 698.0 tok/s** (TTFT 6.73 s / 15.42 s / 34.36 s) | Exact needle retrieval at 10K & 24K, +28–37% over `TF_GLM_MM_CUBLAS=0` baseline |
+| Cold 16K–170K prefill sweep (15.7K / 28.7K / 57.2K / 112.6K / 170.8K + 14-stream concurrent batch) | **~510 tok/s prefill**, **31.4–36.5 tok/s** decode (TTFT 29.9 s / 56.5 s / 111.2 s / 219.9 s / 336.0 s) | EXL3, 4 rails (`0,1,2,3`), `TF_GLM_MM_CUBLAS=0`, 2048-row passes |
+| Cold ~4K / ~10K / ~24K prefill (EXL3, `GLM_MM_CUBLAS=1`, `TF_GLM_CHUNK_SOLO=4096`, `TF_GLM_OVERLAP_PIECES=8`, patches `0017`–`0020`) | **626.3 / 659.4 / 698.0 tok/s** (TTFT 6.73 s / 15.42 s / 34.36 s) | Exact needle retrieval at 10K & 24K, +28–37% over `TF_GLM_MM_CUBLAS=0` baseline |
+| Cold 4K / 12.7K / 32K / 78K prefill (`nvidia/GLM-5.3-Flash-NVFP4`, `GLM_MM_CUBLAS=1`, `TF_GLM_CHUNK_SOLO=4096`, patches `0017`–`0021`) | **812.9 / 1,039.0 / 1,077.2 / 1,131.6 tok/s** (wall 4.99 s / 12.23 s / 29.77 s / 69.00 s) | Exact needle retrieval across all 4 lengths, **42.7 tok/s** 1-stream decode (DFlash2), 0 errors across 75-length LRU stress test |
 
 ## Tuning knobs
 

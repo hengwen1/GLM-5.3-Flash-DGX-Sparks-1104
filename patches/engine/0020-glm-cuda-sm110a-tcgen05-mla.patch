@@ -1,5 +1,5 @@
 diff --git a/zig/kernels/cuda/common/mla.cuh b/zig/kernels/cuda/common/mla.cuh
-index fb535d042..fc5b8a6b8 100644
+index fb535d0..fc5b8a6 100644
 --- a/zig/kernels/cuda/common/mla.cuh
 +++ b/zig/kernels/cuda/common/mla.cuh
 @@ -37,6 +37,368 @@ __device__ __forceinline__ int wide(int row, int u) { return row * KW + ((u ^ (r
@@ -385,7 +385,7 @@ index fb535d042..fc5b8a6b8 100644
    extern __shared__ __align__(16) unsigned char smem[];
    __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
 diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
-index 7329a6bca..ada969286 100644
+index 7329a6b..ada9692 100644
 --- a/zig/src/families/glm/cuda_glue.zig
 +++ b/zig/src/families/glm/cuda_glue.zig
 @@ -79,18 +79,37 @@ pub const Kernels = struct {
@@ -430,78 +430,10 @@ index 7329a6bca..ada969286 100644
  fn rowsLaunch(f: cuda.Function, stream: cuda.Stream, a: *cuda.Args, rows: usize, d: usize) !void {
      try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(d, 256) }, .block = .{ .x = 256 } }, stream, a);
 diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
-index f141fa143..e635d5d57 100644
+index 23ed9aa..e635d5d 100644
 --- a/zig/src/families/glm/cuda_latent.zig
 +++ b/zig/src/families/glm/cuda_latent.zig
-@@ -4,6 +4,7 @@ const std = @import("std");
- const cuda = @import("cuda");
- const cuda_pdl = @import("cuda_pdl.zig");
- const glue = @import("cuda_glue.zig");
-+const mm_mod = @import("cuda_mm.zig");
- 
- /// latent.CHUNK, KT, HB, HB_WIDE, PROMPT_ROWS, PROMPT_RB.
- pub const chunk = 512;
-@@ -30,6 +31,29 @@ fn cdiv(a: usize, b: usize) u32 {
- /// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
- pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
-     if (d != 256 or lw != 512) return error.LatentShape;
-+    if (rows >= prompt_rows and mm_mod.cublasEnabled()) {
-+        // Col-major batched: QA_h^T [lw, rows] = WK_h^T [lw, d] . Q_h^T [d, rows], batch = heads
-+        const spec: cuda.cublaslt.Spec = .{
-+            .ta = .n,
-+            .tb = .n,
-+            .m = lw,
-+            .n = rows,
-+            .k = d,
-+            .a = .bf16,
-+            .b = .bf16,
-+            .c = .bf16,
-+            .lda = lw,
-+            .ldb = heads * d,
-+            .ldc = heads * lw,
-+            .batch = @intCast(heads),
-+            .sa = d * lw,
-+            .sb = d,
-+            .sc = lw,
-+        };
-+        if (mm_mod.cublasBatched(stream, spec, wk, q, out)) return else |e| {
-+            std.log.err("absorbQ cuBLASLt {d}x{d}: {}; falling back to kernel", .{ rows, heads, e });
-+        }
-+    }
-     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
- }
- 
-@@ -44,6 +68,29 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
- /// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
- pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
-     if (dv != 256 or lw != 512) return error.LatentShape;
-+    if (rows >= prompt_rows and mm_mod.cublasEnabled()) {
-+        // Col-major batched: VN_h^T [dv, rows] = (WV_h^T)^T [dv, lw] . OL_h^T [lw, rows], batch = heads
-+        const spec: cuda.cublaslt.Spec = .{
-+            .ta = .t,
-+            .tb = .n,
-+            .m = dv,
-+            .n = rows,
-+            .k = lw,
-+            .a = .bf16,
-+            .b = .bf16,
-+            .c = .bf16,
-+            .lda = lw,
-+            .ldb = heads * lw,
-+            .ldc = heads * dv,
-+            .batch = @intCast(heads),
-+            .sa = dv * lw,
-+            .sb = lw,
-+            .sc = dv,
-+        };
-+        if (mm_mod.cublasBatched(stream, spec, wv, ol, out)) return else |e| {
-+            std.log.err("expandV cuBLASLt {d}x{d}: {}; falling back to kernel", .{ rows, heads, e });
-+        }
-+    }
-     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
- }
- 
-@@ -116,7 +163,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64,
+@@ -163,7 +163,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64,
          a.add(t.pt);
          a.add(@as(i64, @intCast(t.ps)));
      }
@@ -510,96 +442,3 @@ index f141fa143..e635d5d57 100644
      try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
  }
  
-diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
-index 61b4b192e..193eaa4dc 100644
---- a/zig/src/families/glm/cuda_mm.zig
-+++ b/zig/src/families/glm/cuda_mm.zig
-@@ -126,7 +126,9 @@ pub fn cublasEnabled() bool {
- 
- /// One plan a (m, n, k, out type): cuBLASLt's algorithm choice for the shape, kept for the next call.
- const Plan = struct { m: u64, n: u64, k: u64, out_f32: bool, lin: cuda.cublaslt.Linear };
-+const BPlan = struct { spec: cuda.cublaslt.Spec, gemm: cuda.cublaslt.Gemm };
- const max_plans = 512; // a prompt's row counts vary (chunk, tail, batched rows): one plan a shape
-+const max_bplans = 128; // strided batched GEMM plans (absorb_q / expand_v prompt passes)
- const max_ws = 4; // streams that run prompt matmuls (the main one and a pair's side stream); each its own workspace
- 
- /// The cuBLASLt library, a workspace per stream and the plans, opened on the first prompt matmul (TF_GLM_MM_CUBLAS).
-@@ -139,6 +141,9 @@ const Blas = struct {
-     n_ws: usize = 0,
-     plans: [max_plans]Plan = undefined,
-     n_plans: usize = 0,
-+    bhandle: ?cuda.cublaslt.Handle = null,
-+    bplans: [max_bplans]BPlan = undefined,
-+    n_bplans: usize = 0,
-     lock: std.atomic.Mutex = .unlocked,
- };
- var blas_state: ?Blas = null;
-@@ -153,24 +158,47 @@ fn blasFor(d: *const cuda.Driver) !*Blas {
-     return &blas_state.?;
- }
- 
-+fn wsFor(b: *Blas, s: cuda.Stream) !usize {
-+    for (b.ws_stream[0..b.n_ws], 0..) |h, i| if (h == s.handle) return i;
-+    if (b.n_ws == max_ws) return error.TooManyStreams;
-+    b.ws[b.n_ws] = try cuda.DeviceBuffer.alloc(s.d, b.ws_len);
-+    b.ws_stream[b.n_ws] = s.handle;
-+    const idx = b.n_ws;
-+    b.n_ws += 1;
-+    return idx;
-+}
-+
-+/// Strided batched BF16 GEMM (FP32 accumulate) on the shared cuBLASLt library & per-stream workspace.
-+pub fn cublasBatched(s: cuda.Stream, spec: cuda.cublaslt.Spec, a: u64, b_ptr: u64, c: u64) !void {
-+    const b = try blasFor(s.d);
-+    while (!b.lock.tryLock()) std.Thread.yield() catch {};
-+    defer b.lock.unlock();
-+    const ws = try wsFor(b, s);
-+    if (b.bhandle == null) b.bhandle = try cuda.cublaslt.createHandle(&b.lt);
-+    var plan: ?*BPlan = null;
-+    for (b.bplans[0..b.n_bplans]) |*p| {
-+        if (std.meta.eql(p.spec, spec)) {
-+            plan = p;
-+            break;
-+        }
-+    }
-+    if (plan == null) {
-+        if (b.n_bplans == max_bplans) return error.TooManyPlans;
-+        const p = &b.bplans[b.n_bplans];
-+        p.* = .{ .spec = spec, .gemm = try cuda.cublaslt.Gemm.init(&b.lt, b.bhandle.?, spec, b.ws_len) };
-+        b.n_bplans += 1;
-+        plan = p;
-+    }
-+    try plan.?.gemm.run(1.0, a, b_ptr, 0.0, c, b.ws[ws].ptr, b.ws_len, s.handle);
-+}
-+
- /// D[rows][n] = X[rows][k] . W[n][k]^T in bf16 with fp32 accumulate, out fp32 (`out_f32`) or bf16.
- fn cublasMm(s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, kk: usize, out_f32: bool) !void {
-     const b = try blasFor(s.d);
-     while (!b.lock.tryLock()) std.Thread.yield() catch {};
-     defer b.lock.unlock();
-     const out_ty: cuda.cublaslt.DataType = if (out_f32) .f32 else .bf16;
--    var ws: ?usize = null;
--    for (b.ws_stream[0..b.n_ws], 0..) |h, i| if (h == s.handle) {
--        ws = i;
--        break;
--    };
--    if (ws == null) {
--        if (b.n_ws == max_ws) return error.TooManyStreams;
--        b.ws[b.n_ws] = try cuda.DeviceBuffer.alloc(s.d, b.ws_len);
--        b.ws_stream[b.n_ws] = s.handle;
--        ws = b.n_ws;
--        b.n_ws += 1;
--    }
-+    const ws = try wsFor(b, s);
-     var plan: ?*Plan = null;
-     for (b.plans[0..b.n_plans]) |*p| {
-         if (p.m == rows and p.n == n and p.k == kk and p.out_f32 == out_f32) {
-@@ -185,7 +213,7 @@ fn cublasMm(s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, kk:
-         b.n_plans += 1;
-         plan = p;
-     }
--    try plan.?.lin.run(x, w, out, b.ws[ws.?].ptr, b.ws_len, s.handle);
-+    try plan.?.lin.run(x, w, out, b.ws[ws].ptr, b.ws_len, s.handle);
- }
- 
- /// K slices fixed by the shape: column tiles times slices reach the target, each slice at least 4 groups of 64.

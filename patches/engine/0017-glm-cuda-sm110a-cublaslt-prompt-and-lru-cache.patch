@@ -1,19 +1,5 @@
-From b4a88df298a11b011808d4ff55b990ee3ff95dec Mon Sep 17 00:00:00 2001
-From: test <test@thor.local>
-Date: Sun, 22 Nov 2026 20:45:43 -0500
-Subject: [PATCH] glm-cuda: sm_110a EXL3 AHEAD, TF_GLM_MM_CUBLAS, and sm_110
- mailbox
-
----
- zig/build/tp.zig                     |   2 +-
- zig/kernels/cuda/exl3_experts.cu     |   5 +-
- zig/src/families/glm/cuda_engine.zig |   4 +
- zig/src/families/glm/cuda_mm.zig     | 120 ++++++++++++++++++++++++++-
- zig/src/families/glm/cuda_tile.zig   |  50 ++++++++++-
- 5 files changed, 173 insertions(+), 8 deletions(-)
-
 diff --git a/zig/build/tp.zig b/zig/build/tp.zig
-index 004f63ced..ef84ad077 100644
+index 004f63c..ef84ad0 100644
 --- a/zig/build/tp.zig
 +++ b/zig/build/tp.zig
 @@ -40,7 +40,7 @@ pub fn moduleWith(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
@@ -25,24 +11,8 @@ index 004f63ced..ef84ad077 100644
      const out = run.addOutputFileArg("tp_mailbox.fatbin");
      run.addFileArg(b.path("zig/src/fabric/tp/mailbox.cu"));
      _ = run.addFileInput(b.path("zig/src/fabric/tp/roce_device.cuh"));
-diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
-index 4ed09fee0..c0253a749 100644
---- a/zig/kernels/cuda/exl3_experts.cu
-+++ b/zig/kernels/cuda/exl3_experts.cu
-@@ -10,8 +10,9 @@
- 
- // ---------------------------------------------------------------------------------------------------------------
- 
--// sm_120 and sm_121 read a warp's next k tile ahead, bit-equal (contract_exl3_grouped.zig); older SMs keep main's loop.
--#if __CUDA_ARCH__ >= 1200
-+// sm_110 (Jetson AGX Thor), sm_120 and sm_121 read a warp's next k tile ahead, bit-equal (contract_exl3_grouped.zig);
-+// older SMs keep main's loop.
-+#if __CUDA_ARCH__ >= 1100
- constexpr int GROUPED_LOAD = tf_exl3::AHEAD;
- #else
- constexpr int GROUPED_LOAD = tf_exl3::PLAIN;
 diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
-index b8353afba..4c430e012 100644
+index b8353af..4c430e0 100644
 --- a/zig/src/families/glm/cuda_engine.zig
 +++ b/zig/src/families/glm/cuda_engine.zig
 @@ -194,6 +194,8 @@ pub const Engine = struct {
@@ -63,8 +33,80 @@ index b8353afba..4c430e012 100644
          if (e.drafter) |dr| dr.deinit();
          var it = e.snaps.valueIterator();
          while (it.next()) |s| e.freeSnap(s);
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index f141fa1..23ed9aa 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const cuda_pdl = @import("cuda_pdl.zig");
+ const glue = @import("cuda_glue.zig");
++const mm_mod = @import("cuda_mm.zig");
+ 
+ /// latent.CHUNK, KT, HB, HB_WIDE, PROMPT_ROWS, PROMPT_RB.
+ pub const chunk = 512;
+@@ -30,6 +31,29 @@ fn cdiv(a: usize, b: usize) u32 {
+ /// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
+ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
+     if (d != 256 or lw != 512) return error.LatentShape;
++    if (rows >= prompt_rows and mm_mod.cublasEnabled()) {
++        // Col-major batched: QA_h^T [lw, rows] = WK_h^T [lw, d] . Q_h^T [d, rows], batch = heads
++        const spec: cuda.cublaslt.Spec = .{
++            .ta = .n,
++            .tb = .n,
++            .m = lw,
++            .n = rows,
++            .k = d,
++            .a = .bf16,
++            .b = .bf16,
++            .c = .bf16,
++            .lda = lw,
++            .ldb = heads * d,
++            .ldc = heads * lw,
++            .batch = @intCast(heads),
++            .sa = d * lw,
++            .sb = d,
++            .sc = lw,
++        };
++        if (mm_mod.cublasBatched(stream, spec, wk, q, out)) return else |e| {
++            std.log.err("absorbQ cuBLASLt {d}x{d}: {}; falling back to kernel", .{ rows, heads, e });
++        }
++    }
+     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
+ }
+ 
+@@ -44,6 +68,29 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
+ /// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
+ pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
+     if (dv != 256 or lw != 512) return error.LatentShape;
++    if (rows >= prompt_rows and mm_mod.cublasEnabled()) {
++        // Col-major batched: VN_h^T [dv, rows] = (WV_h^T)^T [dv, lw] . OL_h^T [lw, rows], batch = heads
++        const spec: cuda.cublaslt.Spec = .{
++            .ta = .t,
++            .tb = .n,
++            .m = dv,
++            .n = rows,
++            .k = lw,
++            .a = .bf16,
++            .b = .bf16,
++            .c = .bf16,
++            .lda = lw,
++            .ldb = heads * lw,
++            .ldc = heads * dv,
++            .batch = @intCast(heads),
++            .sa = dv * lw,
++            .sb = lw,
++            .sc = dv,
++        };
++        if (mm_mod.cublasBatched(stream, spec, wv, ol, out)) return else |e| {
++            std.log.err("expandV cuBLASLt {d}x{d}: {}; falling back to kernel", .{ rows, heads, e });
++        }
++    }
+     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
+ }
+ 
 diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
-index d1f8dfe11..61b4b192e 100644
+index d1f8dfe..d351aaa 100644
 --- a/zig/src/families/glm/cuda_mm.zig
 +++ b/zig/src/families/glm/cuda_mm.zig
 @@ -4,7 +4,8 @@ const cuda = @import("cuda");
@@ -113,7 +155,7 @@ index d1f8dfe11..61b4b192e 100644
      }
  };
  
-@@ -83,6 +99,95 @@ pub fn sharedBytes(bits: u8, bm: usize) u32 {
+@@ -83,6 +99,173 @@ pub fn sharedBytes(bits: u8, bm: usize) u32 {
      return @intCast(3 * (bm * 128 + 8 * 32 * wpc * 4 + 128));
  }
  
@@ -142,12 +184,14 @@ index d1f8dfe11..61b4b192e 100644
 +    return cublasConfig().on;
 +}
 +
-+/// One plan a (m, n, k, out type): cuBLASLt's algorithm choice for the shape, kept for the next call.
-+const Plan = struct { m: u64, n: u64, k: u64, out_f32: bool, lin: cuda.cublaslt.Linear };
-+const max_plans = 512; // a prompt's row counts vary (chunk, tail, batched rows): one plan a shape
++/// One plan a (m, n, k, out type): cuBLASLt's algorithm choice for the shape, kept for the next call (LRU-evicted when full).
++const Plan = struct { m: u64, n: u64, k: u64, out_f32: bool, gemm: cuda.cublaslt.Gemm, last_used: u64 };
++const BPlan = struct { spec: cuda.cublaslt.Spec, gemm: cuda.cublaslt.Gemm, last_used: u64 };
++const max_plans = 512; // a prompt's row counts vary (chunk, tail, batched rows): LRU keeps hot chunk shapes pinned
++const max_bplans = 256; // strided batched GEMM plans (absorb_q / expand_v prompt passes), LRU-evicted when full
 +const max_ws = 4; // streams that run prompt matmuls (the main one and a pair's side stream); each its own workspace
 +
-+/// The cuBLASLt library, a workspace per stream and the plans, opened on the first prompt matmul (TF_GLM_MM_CUBLAS).
++/// The cuBLASLt library, one shared handle, a workspace per stream and the LRU plan caches (TF_GLM_MM_CUBLAS).
 +/// Two streams never share a workspace: a paired prompt's chunks run their linears at the same time.
 +const Blas = struct {
 +    lt: cuda.cublaslt.Library,
@@ -155,8 +199,12 @@ index d1f8dfe11..61b4b192e 100644
 +    ws_stream: [max_ws]cuda.abi.Stream = undefined,
 +    ws: [max_ws]cuda.DeviceBuffer = undefined,
 +    n_ws: usize = 0,
++    handle: ?cuda.cublaslt.Handle = null,
 +    plans: [max_plans]Plan = undefined,
 +    n_plans: usize = 0,
++    bplans: [max_bplans]BPlan = undefined,
++    n_bplans: usize = 0,
++    tick: u64 = 0,
 +    lock: std.atomic.Mutex = .unlocked,
 +};
 +var blas_state: ?Blas = null;
@@ -171,45 +219,117 @@ index d1f8dfe11..61b4b192e 100644
 +    return &blas_state.?;
 +}
 +
++fn wsFor(b: *Blas, s: cuda.Stream) !usize {
++    for (b.ws_stream[0..b.n_ws], 0..) |h, i| if (h == s.handle) return i;
++    if (b.n_ws == max_ws) return error.TooManyStreams;
++    b.ws[b.n_ws] = try cuda.DeviceBuffer.alloc(s.d, b.ws_len);
++    b.ws_stream[b.n_ws] = s.handle;
++    const idx = b.n_ws;
++    b.n_ws += 1;
++    return idx;
++}
++
++fn sharedHandle(b: *Blas) !cuda.cublaslt.Handle {
++    if (b.handle) |h| return h;
++    const h = try cuda.cublaslt.createHandle(&b.lt);
++    b.handle = h;
++    return h;
++}
++
++fn nextTick(b: *Blas) u64 {
++    b.tick +%= 1;
++    return b.tick;
++}
++
++/// Strided batched BF16 GEMM (FP32 accumulate) on the shared cuBLASLt library & per-stream workspace.
++pub fn cublasBatched(s: cuda.Stream, spec: cuda.cublaslt.Spec, a: u64, b_ptr: u64, c: u64) !void {
++    const b = try blasFor(s.d);
++    while (!b.lock.tryLock()) std.Thread.yield() catch {};
++    defer b.lock.unlock();
++    const ws = try wsFor(b, s);
++    const handle = try sharedHandle(b);
++    var plan: ?*BPlan = null;
++    for (b.bplans[0..b.n_bplans]) |*p| {
++        if (std.meta.eql(p.spec, spec)) {
++            p.last_used = nextTick(b);
++            plan = p;
++            break;
++        }
++    }
++    if (plan == null) {
++        const gemm = try cuda.cublaslt.Gemm.init(&b.lt, handle, spec, b.ws_len);
++        const slot = if (b.n_bplans < max_bplans) blk: {
++            const idx = b.n_bplans;
++            b.n_bplans += 1;
++            break :blk &b.bplans[idx];
++        } else blk: {
++            var victim: usize = 0;
++            for (b.bplans[1..max_bplans], 1..) |*p, i| {
++                if (p.last_used < b.bplans[victim].last_used) victim = i;
++            }
++            b.bplans[victim].gemm.deinit();
++            break :blk &b.bplans[victim];
++        };
++        slot.* = .{ .spec = spec, .gemm = gemm, .last_used = nextTick(b) };
++        plan = slot;
++    }
++    try plan.?.gemm.run(1.0, a, b_ptr, 0.0, c, b.ws[ws].ptr, b.ws_len, s.handle);
++}
++
 +/// D[rows][n] = X[rows][k] . W[n][k]^T in bf16 with fp32 accumulate, out fp32 (`out_f32`) or bf16.
 +fn cublasMm(s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, kk: usize, out_f32: bool) !void {
 +    const b = try blasFor(s.d);
 +    while (!b.lock.tryLock()) std.Thread.yield() catch {};
 +    defer b.lock.unlock();
 +    const out_ty: cuda.cublaslt.DataType = if (out_f32) .f32 else .bf16;
-+    var ws: ?usize = null;
-+    for (b.ws_stream[0..b.n_ws], 0..) |h, i| if (h == s.handle) {
-+        ws = i;
-+        break;
-+    };
-+    if (ws == null) {
-+        if (b.n_ws == max_ws) return error.TooManyStreams;
-+        b.ws[b.n_ws] = try cuda.DeviceBuffer.alloc(s.d, b.ws_len);
-+        b.ws_stream[b.n_ws] = s.handle;
-+        ws = b.n_ws;
-+        b.n_ws += 1;
-+    }
++    const ws = try wsFor(b, s);
++    const handle = try sharedHandle(b);
 +    var plan: ?*Plan = null;
 +    for (b.plans[0..b.n_plans]) |*p| {
 +        if (p.m == rows and p.n == n and p.k == kk and p.out_f32 == out_f32) {
++            p.last_used = nextTick(b);
 +            plan = p;
 +            break;
 +        }
 +    }
 +    if (plan == null) {
-+        if (b.n_plans == max_plans) return error.TooManyPlans;
-+        const p = &b.plans[b.n_plans];
-+        p.* = .{ .m = rows, .n = n, .k = kk, .out_f32 = out_f32, .lin = try cuda.cublaslt.Linear.init(&b.lt, rows, n, kk, out_ty, b.ws_len) };
-+        b.n_plans += 1;
-+        plan = p;
++        // Column-major view: D^T[n, rows] = W[n, k]^T . X^T[k, rows], identical to cublaslt.Linear.
++        const spec: cuda.cublaslt.Spec = .{
++            .ta = .t,
++            .tb = .n,
++            .m = n,
++            .n = rows,
++            .k = kk,
++            .a = .bf16,
++            .b = .bf16,
++            .c = out_ty,
++            .lda = kk,
++            .ldb = kk,
++            .ldc = n,
++        };
++        const gemm = try cuda.cublaslt.Gemm.init(&b.lt, handle, spec, b.ws_len);
++        const slot = if (b.n_plans < max_plans) blk: {
++            const idx = b.n_plans;
++            b.n_plans += 1;
++            break :blk &b.plans[idx];
++        } else blk: {
++            var victim: usize = 0;
++            for (b.plans[1..max_plans], 1..) |*p, i| {
++                if (p.last_used < b.plans[victim].last_used) victim = i;
++            }
++            b.plans[victim].gemm.deinit();
++            break :blk &b.plans[victim];
++        };
++        slot.* = .{ .m = rows, .n = n, .k = kk, .out_f32 = out_f32, .gemm = gemm, .last_used = nextTick(b) };
++        plan = slot;
 +    }
-+    try plan.?.lin.run(x, w, out, b.ws[ws.?].ptr, b.ws_len, s.handle);
++    try plan.?.gemm.run(1.0, w, x, 0.0, out, b.ws[ws].ptr, b.ws_len, s.handle);
 +}
 +
  /// K slices fixed by the shape: column tiles times slices reach the target, each slice at least 4 groups of 64.
  pub fn splitK(n: usize, k: usize) usize {
      const tiles = (n + 63) / 64;
-@@ -124,6 +229,15 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
+@@ -124,6 +307,15 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
          a.add(@as(c_int, @intCast(sk)));
          const cols: u32 = @intCast((w.n + 63) / 64);
          const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
@@ -226,7 +346,7 @@ index d1f8dfe11..61b4b192e 100644
              try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
          } else { // packed prompts take the 128-row bucket's blocks, one slice
 diff --git a/zig/src/families/glm/cuda_tile.zig b/zig/src/families/glm/cuda_tile.zig
-index 592a24dd2..177a99907 100644
+index 592a24d..177a999 100644
 --- a/zig/src/families/glm/cuda_tile.zig
 +++ b/zig/src/families/glm/cuda_tile.zig
 @@ -146,7 +146,19 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
@@ -318,6 +438,3 @@ index 592a24dd2..177a99907 100644
  }
  
  test "GLM TP3: the tiler keeps unsupported KDA input and view weights in row-major order" {
--- 
-2.43.0
-

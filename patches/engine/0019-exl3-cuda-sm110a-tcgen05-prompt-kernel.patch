@@ -1,37 +1,46 @@
-From f063bc2f73f850ca0f97c0a2b48910f33692aa14 Mon Sep 17 00:00:00 2001
-From: test <test@thor.local>
-Date: Sun, 22 Nov 2026 22:09:18 -0500
-Subject: [PATCH] exl3: sm_110a tcgen05 5th-gen tensor core EXL3 prompt kernel
-
----
- zig/kernels/cuda/exl3_experts.cu    |  32 +++-
- zig/kernels/cuda/exl3_prompt.cuh    | 244 +++++++++++++++++++++++++++-
- zig/tests/cuda/glm_exl3_compact.zig |  29 +++-
- 3 files changed, 296 insertions(+), 9 deletions(-)
-
 diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
-index c0253a749..2419f980f 100644
+index 4ed09fe..214f55a 100644
 --- a/zig/kernels/cuda/exl3_experts.cu
 +++ b/zig/kernels/cuda/exl3_experts.cu
-@@ -303,7 +303,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const hal
+@@ -10,8 +10,9 @@
+ 
+ // ---------------------------------------------------------------------------------------------------------------
+ 
+-// sm_120 and sm_121 read a warp's next k tile ahead, bit-equal (contract_exl3_grouped.zig); older SMs keep main's loop.
+-#if __CUDA_ARCH__ >= 1200
++// sm_110 (Jetson AGX Thor), sm_120 and sm_121 read a warp's next k tile ahead, bit-equal (contract_exl3_grouped.zig);
++// older SMs keep main's loop.
++#if __CUDA_ARCH__ >= 1100
+ constexpr int GROUPED_LOAD = tf_exl3::AHEAD;
+ #else
+ constexpr int GROUPED_LOAD = tf_exl3::PLAIN;
+@@ -302,7 +303,11 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const hal
      const int e = items[3 * item];
      if (e == skip) return;
  
 -    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];   // one buffer for either instantiation
++#if TF_EXL3_PROMPT_TCGEN05
++    extern __shared__ __align__(128) unsigned char smem_raw[];
++#else
 +    __shared__ __align__(128) unsigned char smem_raw[tsmem_bytes<8>()];   // one buffer for either instantiation
++#endif
      __shared__ int rows_sh[TPM];
      prompt_gu<8>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
  }
-@@ -319,7 +319,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_k6(const
+@@ -318,7 +323,11 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_k6(const
      const int e = items[3 * item];
      if (e == skip) return;
  
 -    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<6>()];
++#if TF_EXL3_PROMPT_TCGEN05
++    extern __shared__ __align__(128) unsigned char smem_raw[];
++#else
 +    __shared__ __align__(128) unsigned char smem_raw[tsmem_bytes<6>()];
++#endif
      __shared__ int rows_sh[TPM];
      prompt_gu<6>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
  }
-@@ -338,12 +338,27 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_k6(const
+@@ -337,12 +346,27 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_k6(const
  template <int K2>
  __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const half* __restrict__ svh_d,
          float* __restrict__ y, int K, int D, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp, int lane) {
@@ -40,7 +49,7 @@ index c0253a749..2419f980f 100644
 +    __shared__ uint32_t tmem_addr;
 +    if (warp == 0) {
 +        const uint32_t sh = (uint32_t)__cvta_generic_to_shared(&tmem_addr);
-+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 128;" :: "r"(sh));
++        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 256;" :: "r"(sh));
 +    }
 +    __syncthreads();
 +    const uint32_t taddr = tmem_addr;
@@ -49,8 +58,9 @@ index c0253a749..2419f980f 100644
      float acc[TMT][TNB][4];
      tmain<1, TPM, K2>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
 -    float* Ed = reinterpret_cast<float*>(smem_raw);
+-    for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
 +#endif
-     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
++    for (int hf = 0; hf < TP_PASSES && hf * TPH < cnt; ++hf) {
          if (hf) __syncthreads();
 +#if TF_EXL3_PROMPT_TCGEN05
 +        tspill_tcgen05<1>(Ed, DN_ES, taddr, hf);
@@ -60,14 +70,14 @@ index c0253a749..2419f980f 100644
          __syncthreads();
          for (int i = warp; i < TPH && hf * TPH + i < cnt; i += TNW) {
              const int p = rows_sh[hf * TPH + i];
-@@ -360,13 +375,20 @@ __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const u
+@@ -359,13 +383,24 @@ __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const u
              }
          }
      }
 +#if TF_EXL3_PROMPT_TCGEN05
 +    __syncthreads();
 +    if (warp == 0) {
-+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 128;" :: "r"(taddr));
++        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 256;" :: "r"(taddr));
 +        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
 +    }
 +#endif
@@ -78,29 +88,67 @@ index c0253a749..2419f980f 100644
          float* __restrict__ y, int K, int D, int skip) {
  
 -    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
++#if TF_EXL3_PROMPT_TCGEN05
++    extern __shared__ __align__(128) unsigned char smem_raw[];
++#else
 +    __shared__ __align__(128) unsigned char smem_raw[tsmem_bytes<8>()];
++#endif
      __shared__ int rows_sh[TPM];
      TF_EXL3_PROMPT_DOWN_HEAD()
      prompt_down<8>(Xd, Td, svh_d, y, K, D, smem_raw, rows_sh, cb, e, cnt, warp, lane);
-@@ -377,7 +399,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_k6(cons
+@@ -376,7 +411,11 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_k6(cons
          const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
          float* __restrict__ y, int K, int D, int skip) {
  
 -    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<6>()];
++#if TF_EXL3_PROMPT_TCGEN05
++    extern __shared__ __align__(128) unsigned char smem_raw[];
++#else
 +    __shared__ __align__(128) unsigned char smem_raw[tsmem_bytes<6>()];
++#endif
      __shared__ int rows_sh[TPM];
      TF_EXL3_PROMPT_DOWN_HEAD()
      prompt_down<6>(Xd, Td, svh_d, y, K, D, smem_raw, rows_sh, cb, e, cnt, warp, lane);
 diff --git a/zig/kernels/cuda/exl3_prompt.cuh b/zig/kernels/cuda/exl3_prompt.cuh
-index cbbf60d12..5bca86605 100644
+index cbbf60d..457a7e1 100644
 --- a/zig/kernels/cuda/exl3_prompt.cuh
 +++ b/zig/kernels/cuda/exl3_prompt.cuh
-@@ -43,6 +43,224 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
+@@ -22,16 +22,26 @@ using qmm_frag::ldmatrix4;
+ }
+ namespace tf_exl3_prompt {
+ 
+-constexpr int TPM = 64, TNW = 8, TMT = 16 / TNW, TNB = TPM / 8, TT = TNW * 32, TPH = TPM / 2;
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1100 && defined(__CUDA_ARCH_FEAT_SM110_ALL)
++#define TF_EXL3_PROMPT_TCGEN05 1
++constexpr int TPM = 128, TNW = 8, TMT = 16 / TNW, TNB = TPM / 8, TT = TNW * 32, TPH = 32, TP_PASSES = TPM / TPH;
++#else
++#define TF_EXL3_PROMPT_TCGEN05 0
++constexpr int TPM = 64, TNW = 8, TMT = 16 / TNW, TNB = TPM / 8, TT = TNW * 32, TPH = 32, TP_PASSES = TPM / TPH;
++#endif
+ constexpr int TBK = 32, TKT = TBK / 16, TSTAGES = 3, TXS = TBK + 8;
+ template <int K2>
+-constexpr int twords() { return 16 * TKT * tile_words<K2>(); }   // a stage's weight words: 16 tiles by TKT
++__host__ __device__ constexpr int twords() { return 16 * TKT * tile_words<K2>(); }   // a stage's weight words: 16 tiles by TKT
+ constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;                        // the epilogue sums' row strides (floats)
+ template <int XR, int K2>
+-constexpr int tstage_halves() { return XR * TXS + 2 * twords<K2>(); }
++__host__ __device__ constexpr int tstage_halves() { return XR * TXS + 2 * twords<K2>(); }
+ template <int K2>
+-constexpr int tsmem_bytes() {
++__host__ __device__ constexpr int tsmem_bytes() {
++#if TF_EXL3_PROMPT_TCGEN05
++    const int gu = 2 * (128 * TBK * 2) + 2 * (2 * TPM * TBK * 2) + 2 * twords<K2>() * 4;
++#else
+     const int gu = TSTAGES * tstage_halves<2 * TPM, K2>() * 2;   // gate and up rows apart (no shared rotation)
++#endif
+     const int ep = 2 * TPH * GU_ES * 4, dn = TPH * DN_ES * 4;
+     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
+ }
+@@ -43,6 +53,221 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
      nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
  }
  
-+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1100 && defined(__CUDA_ARCH_FEAT_SM110_ALL)
-+#define TF_EXL3_PROMPT_TCGEN05 1
++#if TF_EXL3_PROMPT_TCGEN05
 +
 +__device__ __forceinline__ uint64_t tcgen05_smem_desc(uint32_t smem_addr, uint32_t lbo_bytes, uint32_t sbo_bytes) {
 +    uint64_t d = 0;
@@ -111,9 +159,9 @@ index cbbf60d12..5bca86605 100644
 +    return d;
 +}
 +
-+// tcgen05.mma.cta_group::1.kind::f16: D=fp32 (1<<4), A=fp16, B=fp16, K-major, N=64 (8<<17), M=128 (8<<24).
-+__device__ __forceinline__ constexpr uint32_t tcgen05_idesc_f16_m128_n64() {
-+    return (1u << 4) | (8u << 17) | (8u << 24);
++// tcgen05.mma.cta_group::1.kind::f16: D=fp32 (1<<4), A=fp16, B=fp16, K-major, N=128 (16<<17), M=128 (8<<24).
++__device__ __forceinline__ constexpr uint32_t tcgen05_idesc_f16_m128_n128() {
++    return (1u << 4) | (16u << 17) | (8u << 24);
 +}
 +
 +__device__ __forceinline__ void tcgen05_mbar_init(uint64_t* mbar, uint32_t count) {
@@ -134,7 +182,7 @@ index cbbf60d12..5bca86605 100644
 +}
 +
 +__device__ __forceinline__ void tcgen05_mma_k32(uint32_t taddr, uint32_t a_base, uint32_t b_base, bool accum) {
-+    constexpr uint32_t idesc = tcgen05_idesc_f16_m128_n64();
++    constexpr uint32_t idesc = tcgen05_idesc_f16_m128_n128();
 +    const uint64_t da0 = tcgen05_smem_desc(a_base, 128, 512);
 +    const uint64_t db0 = tcgen05_smem_desc(b_base, 128, 512);
 +    const uint64_t da1 = tcgen05_smem_desc(a_base + 256, 128, 512);
@@ -277,13 +325,13 @@ index cbbf60d12..5bca86605 100644
 +        if (c + 1 < chunks) load_bw(c + 1);
 +        cp_commit();
 +
-+        // Half 1 (up / down cols 128..255) -> TMEM [taddr + 64, taddr + 128), overlapping half 0 MMA & prefetch.
++        // Half 1 (up / down cols 128..255) -> TMEM [taddr + 128, taddr + 256), overlapping half 0 MMA & prefetch.
 +        decode_half(ws, A1_u32, 1);
 +        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 +        __syncthreads();
 +        if (tid == 0) {
 +            const uint32_t b_h1 = b_slot + (uint32_t)(XR == TPM ? 0 : (TPM * TBK * 2));
-+            tcgen05_mma_k32(taddr + 64u, a1_smem, b_h1, c > 0);
++            tcgen05_mma_k32(taddr + 128u, a1_smem, b_h1, c > 0);
 +            tcgen05_commit(&mbar[1]);
 +        }
 +    }
@@ -296,15 +344,15 @@ index cbbf60d12..5bca86605 100644
 +    __syncthreads();
 +}
 +
-+// Spill 32 tokens (half `hf` of TPM=64) from TMEM [taddr, taddr+128) into epilogue SMEM.
-+// Warps 0..3 read half_id=0 (TMEM +0), warps 4..7 read half_id=1 (TMEM +64) simultaneously.
++// Spill 32 tokens (pass `hf` of TPM=128) from TMEM [taddr, taddr+256) into epilogue SMEM.
++// Warps 0..3 read half_id=0 (TMEM +0), warps 4..7 read half_id=1 (TMEM +128) simultaneously.
 +template <int MATS>
 +__device__ __forceinline__ void tspill_tcgen05(float* E, int ES, uint32_t taddr, int hf) {
 +    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 +    const int half_id = warp >> 2;
 +    const int col = (MATS == 1 ? half_id * 128 : 0) + (warp & 3) * 32 + lane;
 +    float* dst = (MATS == 2) ? (E + (size_t)half_id * TPH * ES) : E;
-+    const uint32_t base_col = (uint32_t)(half_id * 64 + hf * TPH);
++    const uint32_t base_col = (uint32_t)(half_id * TPM + hf * TPH);
 +#pragma unroll
 +    for (int sub = 0; sub < 2; ++sub) {
 +        uint32_t r[16];
@@ -313,14 +361,12 @@ index cbbf60d12..5bca86605 100644
 +        for (int t = 0; t < 16; ++t) dst[(size_t)(sub * 16 + t) * ES + col] = __uint_as_float(r[t]);
 +    }
 +}
-+#else
-+#define TF_EXL3_PROMPT_TCGEN05 0
 +#endif
 +
  // Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM).
  template <int MATS, int XR, int K2>
  __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
-@@ -151,16 +369,31 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
+@@ -151,16 +376,31 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
      if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
      __syncthreads();
      const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -330,7 +376,7 @@ index cbbf60d12..5bca86605 100644
 +    __shared__ uint32_t tmem_addr;
 +    if (warp == 0) {
 +        const uint32_t sh = (uint32_t)__cvta_generic_to_shared(&tmem_addr);
-+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 128;" :: "r"(sh));
++        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 256;" :: "r"(sh));
 +    }
 +    __syncthreads();
 +    const uint32_t taddr = tmem_addr;
@@ -343,9 +389,11 @@ index cbbf60d12..5bca86605 100644
      ttile<2>(warp * TMT, cb, mat, nt);
      const int col0 = (nt - cb * 8) * 16;
 -    const int n = cb * 128 + 4 * lane;
+-    for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
+-        if (hf) __syncthreads();   // the first half's rows are read
 +#endif
-     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
-         if (hf) __syncthreads();   // the first half's rows are read
++    for (int hf = 0; hf < TP_PASSES && hf * TPH < cnt; ++hf) {
++        if (hf) __syncthreads();   // the previous pass's rows are read
 +#if TF_EXL3_PROMPT_TCGEN05
 +        tspill_tcgen05<2>(Eg, GU_ES, taddr, hf);
 +#else
@@ -354,22 +402,112 @@ index cbbf60d12..5bca86605 100644
          __syncthreads();
          for (int i = warp; i < TPH && hf * TPH + i < cnt; i += TNW) {
              const int p = rows_sh[hf * TPH + i];
-@@ -191,6 +424,13 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
+@@ -191,6 +431,13 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
              for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
          }
      }
 +#if TF_EXL3_PROMPT_TCGEN05
 +    __syncthreads();
 +    if (warp == 0) {
-+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 128;" :: "r"(taddr));
++        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 256;" :: "r"(taddr));
 +        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
 +    }
 +#endif
  }
  
  }  // namespace tf_exl3_prompt
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index 8720cda..349c443 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -1,5 +1,6 @@
+ //! The common EXL3 prompt path, after @BobClawblaw's #976 design and MiaAI-Lab's transposed kernels.
+ const std = @import("std");
++const abi = @import("abi.zig");
+ const ex = @import("exl3_experts.zig");
+ const launch = @import("launch.zig");
+ const grouped = @import("grouped.zig");
+@@ -8,6 +9,9 @@ const Function = @import("module.zig").Function;
+ const Stream = @import("stream.zig").Stream;
+ 
+ pub const tile = 64;
++const sm110_tile = 128;
++const sm110_smem_gu: u32 = 57_344; // 2*8192 + 2*(256*32*2) + 2*4096 (unshared XR=256)
++const sm110_smem_shared: u32 = 40_960; // 2*8192 + 2*(128*32*2) + 2*4096 (shared XR=128 & down)
+ pub const Scratch = struct { xg: u64, xu: u64, xd: u64, rows: usize, slots: usize };
+ /// A group's verified half-bit width: its own field, else uniform_k2; 0 when unverified or the two disagree.
+ fn verified(group: u32, uniform: u32) u32 {
+@@ -53,10 +57,10 @@ pub fn scratch(base: u64, l: ex.Layer, rows: usize, slots: usize) !Scratch {
+     _ = std.math.add(u64, base, total) catch return error.Exl3Shape;
+     return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .rows = rows, .slots = slots };
+ }
+-fn go(f: Function, s: Stream, grid: [3]usize, threads: u32, values: anytype) !void {
++fn go(f: Function, s: Stream, grid: [3]usize, threads: u32, shared: u32, values: anytype) !void {
+     var args: launch.Args = .{};
+     inline for (values) |v| args.add(v);
+-    try launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads } }, s, &args);
++    try launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads }, .shared = shared }, s, &args);
+ }
+ fn i(n: usize) i32 {
+     return @intCast(n);
+@@ -67,14 +71,28 @@ pub const Kernels = struct {
+     down: Function, // 4-bit down
+     gateup_k6: Function, // 3-bit gate and up, gateup's arguments
+     down_k6: Function, // 3-bit down, down's arguments
++    sm110: bool = false,
+     pub fn resolve(mod: Module) !Kernels {
+-        return .{
++        var dev: abi.Device = 0;
++        var major: c_int = 0;
++        const is_sm110 = mod.d.api.cuCtxGetDevice(&dev) == abi.success and
++            mod.d.api.cuDeviceGetAttribute(&major, .compute_capability_major, dev) == abi.success and
++            major == 11;
++        var k: Kernels = .{
+             .rotate = try mod.function("tf_exl3_prompt_rotate"),
+             .gateup = try mod.function("tf_exl3_prompt_gu"),
+             .down = try mod.function("tf_exl3_prompt_down"),
+             .gateup_k6 = try mod.function("tf_exl3_prompt_gu_k6"),
+             .down_k6 = try mod.function("tf_exl3_prompt_down_k6"),
++            .sm110 = is_sm110,
+         };
++        if (is_sm110) {
++            try k.gateup.allowDynamicShared(sm110_smem_gu);
++            try k.gateup_k6.allowDynamicShared(sm110_smem_gu);
++            try k.down.allowDynamicShared(sm110_smem_shared);
++            try k.down_k6.allowDynamicShared(sm110_smem_shared);
++        }
++        return k;
+     }
+     /// `skip` is the shared expert's id, equal to the routed count; its output slot stays owned by the caller.
+     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize) !void {
+@@ -85,17 +103,20 @@ pub const Kernels = struct {
+         const skip_id: i32 = if (skip) |id| i(id) else -1;
+         const pairs = rows * sc.slots;
+         const w = widths(l);
+-        try router.route(s, picks, pairs, count, tile, p);
++        const tsz: usize = if (k.sm110) sm110_tile else tile;
++        try router.route(s, picks, pairs, count, tsz, p);
+         if (l.shared_input) {
+-            try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
++            try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, 0, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
+         } else {
+             var args: launch.Args = .{};
+             inline for (.{ x, i(stride), @as(i32, @backingInt(ex.DType.bf16)), picks, l.suh_g, l.suh_u, sc.xg, sc.xu, i(l.dims), i(sc.slots), i(l.experts) }) |v| args.add(v);
+             try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
+         }
+-        const items = grouped.maxItems(pairs, count, tile);
+-        try go(if (w.gu == 6) k.gateup_k6 else k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, skip_id });
+-        try go(if (w.d == 6) k.down_k6 else k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), skip_id });
++        const items = grouped.maxItems(pairs, count, tsz);
++        const gu_smem: u32 = if (!k.sm110) 0 else if (l.shared_input) sm110_smem_shared else sm110_smem_gu;
++        const dn_smem: u32 = if (!k.sm110) 0 else sm110_smem_shared;
++        try go(if (w.gu == 6) k.gateup_k6 else k.gateup, s, .{ l.width / 128, items, 1 }, 256, gu_smem, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, skip_id });
++        try go(if (w.d == 6) k.down_k6 else k.down, s, .{ l.dims / 256, items, 1 }, 256, dn_smem, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), skip_id });
+     }
+ };
+ 
 diff --git a/zig/tests/cuda/glm_exl3_compact.zig b/zig/tests/cuda/glm_exl3_compact.zig
-index b02ed09b0..2a6a0c34a 100644
+index b02ed09..2a6a0c3 100644
 --- a/zig/tests/cuda/glm_exl3_compact.zig
 +++ b/zig/tests/cuda/glm_exl3_compact.zig
 @@ -10,7 +10,30 @@ const experts = glm.experts;
@@ -415,6 +553,3 @@ index b02ed09b0..2a6a0c34a 100644
  }
  pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, ey: u64) !void {
      return compact(k, ek, stream, w, sc, plan_buf, x, x_stride, picks, slots, rows, count, dims, width, limit, true, ey);
--- 
-2.43.0
-
