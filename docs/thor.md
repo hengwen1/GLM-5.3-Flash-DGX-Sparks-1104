@@ -164,7 +164,7 @@ ls -l /dev/mgbe_zc   # crw-rw---- 1 root mgbe_zc
 ./tests/zc_hw_selftest --ports 0,1,2,3
 ```
 
-## Engine patches for Thor (`0017`–`0020`)
+## Engine patches for Thor (`0017`–`0023`)
 
 - **`0017-glm-cuda-sm110a-exl3-ahead-and-TF_GLM_MM_CUBLAS.patch`**:
   - Enables `GROUPED_LOAD = tf_exl3::AHEAD` for `__CUDA_ARCH__ >= 1100` in `exl3_experts.cu`.
@@ -190,6 +190,9 @@ ls -l /dev/mgbe_zc   # crw-rw---- 1 root mgbe_zc
   - Fixes lost final `Op.ack` deadlock in `runDdp()` via `flag_retrans` post-exit `Op.ack` replies in `drainCtrlRx()`.
   - Guards `tx_acked = true` with `tx_sent == win_pkts` and bounds `peer_max_seq` updates to data opcodes within `1..slots` ahead of `last_seq`.
   - Adds 50 ms total-loss DDP window recovery (`Op.nack` with bumped `cts_gen`), keeps draining `ctrl_q` on worker error to prevent MAC RX FIFO overflow from starving `VDMA 0/1` TCP/liveness, and logs `ctrl_q`/`data_q` DMA registers on timeout.
+- **`0023-glm-cuda-sm110a-tcgen05-mla-and-cublas-absorb.patch`**:
+  - Adds `chunks_32_tcgen05` in `zig/kernels/cuda/common/mla.cuh` (gated on `sm_110a`, `KT=128`, `M=128, N=32` `tcgen05.mma.cta_group::1.kind::f16` for both `QK^T` K-major and `PV` MN-major with `SWIZZLE_128B`, 128 TMEM columns, 0 register spills, 1-warp-per-key coalesced 16-byte FP8 loads, 8-warp parallel online softmax) with `sm_110`-only `193,536 B` dynamic SMEM in `cuda_glue.zig` / `cuda_latent.zig`.
+  - Routes prompt-chunk (`rows >= 64`) `absorbQ` and `expandV` through `cuBLASLt` strided batched BF16 GEMM (`cuda_mm.zig` / `cuda_latent.zig`, gated on `TF_GLM_MM_CUBLAS=1`, zero extra VRAM, decode windows untouched), cutting 11-layer absorb+expand from ~589 ms to ~20 ms per 4,096-row pass.
 
 ## Measured kernel & transport gates on 2× Jetson AGX Thor
 
@@ -229,7 +232,8 @@ Measured greedy (`temperature=0`, `enable_thinking=false`, fresh prompts, `0` ne
 | 4-stream decode (4 × 256 tok) | **38.9–46.7 tok/s agg** (12.8–13.2 tok/s/stream) | 21.9–26.4 s wall |
 | Cold ~4K prefill (3,948 tok) | **488.9 tok/s** (TTFT 8.08 s) | `TF_GLM_MM_CUBLAS=0`, 2048-row passes |
 | Cold ~8K prefill (8,429 tok) | **479.2 tok/s** (TTFT 17.59 s) | Exact retrieval, 0 RX FIFO overflows, stays healthy |
-| Cold 16K–170K prefill sweep (15.7K / 28.7K / 57.2K / 112.6K / 170.8K + 14-stream concurrent batch) | **~510 tok/s prefill**, **31.4–36.5 tok/s** decode (TTFT 29.9 s / 56.5 s / 111.2 s / 219.9 s / 336.0 s) | Patch `0020`, 4 rails (`0,1,2,3`), 0 `mgbe_zc` errors, 0 new `mmc_rx_fifo_overflow` across all 8 ports |
+| Cold 16K–170K prefill sweep (15.7K / 28.7K / 57.2K / 112.6K / 170.8K + 14-stream concurrent batch) | **~510 tok/s prefill**, **31.4–36.5 tok/s** decode (TTFT 29.9 s / 56.5 s / 111.2 s / 219.9 s / 336.0 s) | Patch `0020`, 4 rails (`0,1,2,3`), `TF_GLM_MM_CUBLAS=0`, 2048-row passes |
+| Cold ~4K / ~10K / ~24K prefill (`GLM_MM_CUBLAS=1`, `TF_GLM_CHUNK_SOLO=4096`, `TF_GLM_OVERLAP_PIECES=8`, patch `0023`) | **626.3 / 659.4 / 698.0 tok/s** (TTFT 6.73 s / 15.42 s / 34.36 s) | Exact needle retrieval at 10K & 24K, +28–37% over `TF_GLM_MM_CUBLAS=0` baseline |
 
 ## Tuning knobs
 

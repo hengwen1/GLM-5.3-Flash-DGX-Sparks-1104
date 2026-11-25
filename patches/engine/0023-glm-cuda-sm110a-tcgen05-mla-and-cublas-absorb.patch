@@ -1,0 +1,605 @@
+diff --git a/zig/kernels/cuda/common/mla.cuh b/zig/kernels/cuda/common/mla.cuh
+index fb535d042..fc5b8a6b8 100644
+--- a/zig/kernels/cuda/common/mla.cuh
++++ b/zig/kernels/cuda/common/mla.cuh
+@@ -37,6 +37,368 @@ __device__ __forceinline__ int wide(int row, int u) { return row * KW + ((u ^ (r
+ // p's [32][32] rows (64 bytes): unit u of row r.
+ __device__ __forceinline__ int narrow(int row, int u) { return row * KT + ((u ^ ((row >> 1) & 3)) << 3); }
+ 
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1100 && defined(__CUDA_ARCH_FEAT_SM110_ALL)
++#define TF_MLA_TCGEN05 1
++
++__device__ __forceinline__ uint64_t tc5_smem_desc_sw128(uint32_t smem_addr, uint32_t lbo_bytes, uint32_t sbo_bytes) {
++  uint64_t d = 0;
++  d |= (uint64_t)((smem_addr & 0x3FFFFu) >> 4);
++  d |= (uint64_t)((lbo_bytes & 0x3FFFFu) >> 4) << 16;
++  d |= (uint64_t)((sbo_bytes & 0x3FFFFu) >> 4) << 32;
++  d |= (uint64_t)1ULL << 46;
++  d |= (uint64_t)2ULL << 61;  // SWIZZLE_128B
++  return d;
++}
++
++__device__ __forceinline__ constexpr uint32_t tc5_idesc_bf16(int M, int N, bool a_mn_major) {
++  return (1u << 4) | (1u << 7) | (1u << 10) | ((a_mn_major ? 1u : 0u) << 15) | ((uint32_t)(N >> 3) << 17) |
++         ((uint32_t)(M >> 4) << 24);
++}
++
++__device__ __forceinline__ void tc5_mbar_init(uint64_t* mbar, uint32_t count) {
++  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(addr), "r"(count) : "memory");
++}
++
++__device__ __forceinline__ void tc5_mbar_wait(uint64_t* mbar, uint32_t parity) {
++  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++  asm volatile(
++      "{\n\t"
++      ".reg .pred done;\n\t"
++      "TF_MLA_TC5_W_%=:\n\t"
++      "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1, 10000000;\n\t"
++      "@!done bra TF_MLA_TC5_W_%=;\n\t"
++      "}\n" ::"r"(addr),
++      "r"(parity)
++      : "memory");
++}
++
++__device__ __forceinline__ void tc5_commit(uint64_t* mbar) {
++  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(mbar);
++  asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];" ::"r"(addr) : "memory");
++}
++
++__device__ __forceinline__ void tc5_mma_one(uint32_t taddr, uint64_t da, uint64_t db, uint32_t idesc, bool accum) {
++  const uint32_t af = accum ? 1u : 0u;
++  asm volatile(
++      "{\n\t"
++      ".reg .pred p0;\n\t"
++      "setp.ne.b32 p0, %4, 0;\n\t"
++      "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p0;\n\t"
++      "}\n" ::"r"(taddr),
++      "l"(da), "l"(db), "r"(idesc), "r"(af)
++      : "memory");
++}
++
++__device__ __forceinline__ void tc5_ld32x32_x16(uint32_t addr, uint32_t (&r)[16]) {
++  asm volatile(
++      "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
++      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];\n\t"
++      "tcgen05.wait::ld.sync.aligned;"
++      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]), "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7]), "=r"(r[8]),
++        "=r"(r[9]), "=r"(r[10]), "=r"(r[11]), "=r"(r[12]), "=r"(r[13]), "=r"(r[14]), "=r"(r[15])
++      : "r"(addr)
++      : "memory");
++}
++
++__device__ __forceinline__ void tc5_cvt_fp8x4_to_bf16x4(uint32_t raw, float rscale, __nv_bfloat162& b0,
++                                                        __nv_bfloat162& b1) {
++  const float2 f0 = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2((uint16_t)(raw & 0xFFFFu), __NV_E4M3)));
++  const float2 f1 = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2((uint16_t)(raw >> 16), __NV_E4M3)));
++  b0 = __floats2bfloat162_rn(__fmul_rn(f0.x, rscale), __fmul_rn(f0.y, rscale));
++  b1 = __floats2bfloat162_rn(__fmul_rn(f1.x, rscale), __fmul_rn(f1.y, rscale));
++}
++
++// sm_110a 5th-gen tensor core MLA chunk attention (HB=32, KT=128, M=128, N=32, 128 TMEM cols, 193536 B dynamic smem).
++// Uses 1-warp-per-key coalesced 16B loads (hoisted tok/pt/scale) and 8-warp parallel softmax over all 32 heads.
++template <bool FP8, bool PAGED8>
++__device__ void chunks_32_tcgen05(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
++                                  const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads,
++                                  int64_t w, float scale, int sparse, const int* pt, int64_t pstep,
++                                  const float* scales) {
++  constexpr int HB = 32, KTC = 128, S_STRIDE = 132;
++  extern __shared__ __align__(16) unsigned char smem[];
++  __nv_bfloat16* sQ = reinterpret_cast<__nv_bfloat16*>(smem);
++  __nv_bfloat16* sKV = sQ + 8 * HB * 64;
++  __nv_bfloat16* sP = sKV + 8 * KTC * 64;
++  float* sS = reinterpret_cast<float*>(sP + 2 * HB * 64);
++  float* s_m = sS + HB * S_STRIDE;
++  float* s_l = s_m + HB;
++  float* s_alp = s_l + HB;
++  uint64_t* mbar = reinterpret_cast<uint64_t*>(s_alp + HB);
++  uint32_t* taddr_sh = reinterpret_cast<uint32_t*>(mbar + 2);
++
++  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
++  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r;
++  const int64_t start = c * CH;
++  const bool live = sparse ? (start < n) : (start <= limit);
++
++  if (!live) {
++    for (int idx = t; idx < HB * LW; idx += 256) {
++      const int hd = idx / LW, d = idx % LW;
++      if (h0 + hd < heads) po[((c * rows + r) * heads + (h0 + hd)) * LW + d] = 0.0f;
++    }
++    if (t < HB && h0 + t < heads) {
++      const int64_t base = (c * rows + r) * heads + (h0 + t);
++      pm[base] = -INFINITY;
++      pl[base] = 0.0f;
++    }
++    return;
++  }
++
++  if (t == 0) {
++    tc5_mbar_init(&mbar[0], 1);
++    tc5_mbar_init(&mbar[1], 1);
++  }
++  if (t < HB) {
++    s_m[t] = -INFINITY;
++    s_l[t] = 0.0f;
++  }
++  if (warp == 0) {
++    const uint32_t sh = (uint32_t)__cvta_generic_to_shared(taddr_sh);
++    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 128;" ::"r"(sh));
++  }
++
++  // Load Q [32 x 512] into 8 SW128 slabs of [32 x 64]
++  for (int idx = t; idx < HB * (LW / 8); idx += 256) {
++    const int hd = idx >> 6, u = idx & 63, slab = u >> 3, u8 = u & 7;
++    const int su = u8 ^ (hd & 7);
++    uint4 v = make_uint4(0, 0, 0, 0);
++    if (h0 + hd < heads) v = __ldg(reinterpret_cast<const uint4*>(qa + (r * heads + h0 + hd) * LW + u * 8));
++    *reinterpret_cast<uint4*>(sQ + slab * (HB * 64) + hd * 64 + su * 8) = v;
++  }
++
++  const __nv_bfloat16* keys_at = (!FP8 && pt && !sparse) ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
++  const unsigned char* codes8 = reinterpret_cast<const unsigned char*>(lc);
++  const float* scales8 = scales;
++  if constexpr (PAGED8) {
++    if (!sparse) {
++      const int64_t page = (int64_t)pt[c] * pstep;
++      codes8 += page - start * LW;
++      scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) - start;
++    }
++  }
++
++  __syncthreads();
++  const uint32_t taddr = *taddr_sh;
++  const uint32_t baseQ = (uint32_t)__cvta_generic_to_shared(sQ);
++  const uint32_t baseKV = (uint32_t)__cvta_generic_to_shared(sKV);
++  const uint32_t baseP = (uint32_t)__cvta_generic_to_shared(sP);
++
++  const int w_grp = warp >> 2, w_in = warp & 3;
++  float o_acc[2][HB];
++#pragma unroll
++  for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++    for (int h = 0; h < HB; ++h) o_acc[mt][h] = 0.0f;
++
++  uint32_t phase0 = 0, phase1 = 0;
++  const int slab_l = lane >> 2, pair_l = (lane & 3) * 2;
++
++  for (int tile = 0; tile < CH / KTC; ++tile) {
++    const int64_t first = start + tile * KTC;
++
++    // 1. Load 128 keys (16 keys/warp, 1 warp/key, coalesced 16B loads with hoisted metadata)
++    for (int ki_w = 0; ki_w < 16; ++ki_w) {
++      const int key = warp * 16 + ki_w;
++      const int64_t ki = first + key;
++      const bool ok = sparse ? (ki < n) : (ki <= limit);
++      uint4 out0 = make_uint4(0, 0, 0, 0), out1 = make_uint4(0, 0, 0, 0);
++      if (ok) {
++        if constexpr (FP8) {
++          int64_t page = 0, crow = 0;
++          float rscale = 1.0f;
++          if (lane == 0) {
++            const int64_t src = sparse ? (int64_t)tok[r * w + ki] : ki;
++            if constexpr (PAGED8) {
++              if (sparse) {
++                const int s = (int)src;
++                page = (int64_t)pt[s >> 9] * pstep;
++                crow = s & (CH - 1);
++                rscale = *reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page +
++                                                         crow * 4);
++              } else {
++                crow = src;
++                rscale = scales8[src];
++              }
++            } else {
++              crow = src;
++              rscale = scales8[src];
++            }
++          }
++          page = __shfl_sync(0xffffffffu, page, 0);
++          crow = __shfl_sync(0xffffffffu, crow, 0);
++          rscale = __shfl_sync(0xffffffffu, rscale, 0);
++          const uint4 raw = __ldg(reinterpret_cast<const uint4*>(codes8 + page + crow * LW + lane * 16));
++          __nv_bfloat162 b0[4], b1[4];
++          tc5_cvt_fp8x4_to_bf16x4(raw.x, rscale, b0[0], b0[1]);
++          tc5_cvt_fp8x4_to_bf16x4(raw.y, rscale, b0[2], b0[3]);
++          tc5_cvt_fp8x4_to_bf16x4(raw.z, rscale, b1[0], b1[1]);
++          tc5_cvt_fp8x4_to_bf16x4(raw.w, rscale, b1[2], b1[3]);
++          out0 = *reinterpret_cast<uint4*>(b0);
++          out1 = *reinterpret_cast<uint4*>(b1);
++        } else {
++          int64_t src = 0;
++          if (lane == 0) src = sparse ? (int64_t)tok[r * w + ki] : ki;
++          src = __shfl_sync(0xffffffffu, src, 0);
++          const __nv_bfloat16* kp = keys_at + src * LW + lane * 16;
++          out0 = __ldg(reinterpret_cast<const uint4*>(kp));
++          out1 = __ldg(reinterpret_cast<const uint4*>(kp + 8));
++        }
++      }
++      const int su0 = pair_l ^ (key & 7), su1 = (pair_l + 1) ^ (key & 7);
++      __nv_bfloat16* dst = sKV + slab_l * (KTC * 64) + key * 64;
++      *reinterpret_cast<uint4*>(dst + su0 * 8) = out0;
++      *reinterpret_cast<uint4*>(dst + su1 * 8) = out1;
++    }
++    __syncthreads();
++
++    // 2. QK^T: K [128 x 512] @ Q^T [512 x 32] -> S^T [128 x 32] in TMEM [0..32)
++    if (t == 0) {
++      constexpr uint32_t idesc_qk = tc5_idesc_bf16(128, 32, false);
++#pragma unroll
++      for (int slab = 0; slab < 8; ++slab) {
++        const uint32_t a_slab = baseKV + slab * 16384;
++        const uint32_t b_slab = baseQ + slab * 4096;
++#pragma unroll
++        for (int k16 = 0; k16 < 64; k16 += 16) {
++          const uint64_t da = tc5_smem_desc_sw128(a_slab + k16 * 2, 16, 1024);
++          const uint64_t db = tc5_smem_desc_sw128(b_slab + k16 * 2, 16, 1024);
++          tc5_mma_one(taddr, da, db, idesc_qk, (slab > 0) || (k16 > 0));
++        }
++      }
++      tc5_commit(&mbar[0]);
++    }
++    tc5_mbar_wait(&mbar[0], phase0);
++    phase0 ^= 1;
++    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
++
++    // 3a. Warps 0..3 read S^T [128 x 32] from TMEM into sS[32][132]
++    if (warp < 4) {
++      const int key = warp * 32 + lane;
++      const int64_t ki = first + key;
++      const bool key_ok = sparse ? (ki < n) : (ki <= limit);
++      uint32_t r0[16];
++      tc5_ld32x32_x16(taddr + ((uint32_t)(warp * 32) << 16) + 0, r0);
++#pragma unroll
++      for (int h = 0; h < 16; ++h) sS[h * S_STRIDE + key] = key_ok ? __fmul_rn(__uint_as_float(r0[h]), scale) : -INFINITY;
++      tc5_ld32x32_x16(taddr + ((uint32_t)(warp * 32) << 16) + 16, r0);
++#pragma unroll
++      for (int h = 0; h < 16; ++h)
++        sS[(16 + h) * S_STRIDE + key] = key_ok ? __fmul_rn(__uint_as_float(r0[h]), scale) : -INFINITY;
++    }
++    __syncthreads();
++
++    // 3b. All 8 warps compute online softmax in parallel (4 heads/warp, 4 keys/lane)
++    {
++      const int p_slab = lane >> 4, u8 = (lane & 15) >> 1, half4 = (lane & 1) * 4;
++#pragma unroll
++      for (int hi = 0; hi < 4; ++hi) {
++        const int h = warp * 4 + hi;
++        const float4 sv = *reinterpret_cast<const float4*>(sS + h * S_STRIDE + lane * 4);
++        float mx = fmaxf(fmaxf(sv.x, sv.y), fmaxf(sv.z, sv.w));
++        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16));
++        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 8));
++        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
++        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
++        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
++
++        const float old_m = s_m[h];
++        const bool active = (mx != -INFINITY);
++        const float nm = active ? fmaxf(old_m, mx) : old_m;
++        const float alp = active ? (old_m == -INFINITY ? 0.0f : glm_triton::exp_approx(old_m - nm)) : 1.0f;
++
++        const float p0 = (active && sv.x != -INFINITY) ? glm_triton::exp_approx(sv.x - nm) : 0.0f;
++        const float p1 = (active && sv.y != -INFINITY) ? glm_triton::exp_approx(sv.y - nm) : 0.0f;
++        const float p2 = (active && sv.z != -INFINITY) ? glm_triton::exp_approx(sv.z - nm) : 0.0f;
++        const float p3 = (active && sv.w != -INFINITY) ? glm_triton::exp_approx(sv.w - nm) : 0.0f;
++
++        const int su = u8 ^ (h & 7);
++        __nv_bfloat162 pb[2];
++        pb[0] = __floats2bfloat162_rn(p0, p1);
++        pb[1] = __floats2bfloat162_rn(p2, p3);
++        *reinterpret_cast<uint2*>(sP + p_slab * (HB * 64) + h * 64 + su * 8 + half4) = *reinterpret_cast<uint2*>(pb);
++
++        float sm = (p0 + p1) + (p2 + p3);
++        sm += __shfl_xor_sync(0xffffffffu, sm, 16);
++        sm += __shfl_xor_sync(0xffffffffu, sm, 8);
++        sm += __shfl_xor_sync(0xffffffffu, sm, 4);
++        sm += __shfl_xor_sync(0xffffffffu, sm, 2);
++        sm += __shfl_xor_sync(0xffffffffu, sm, 1);
++
++        if (lane == 0) {
++          s_m[h] = nm;
++          s_alp[h] = alp;
++          s_l[h] = __fmaf_rn(s_l[h], alp, sm);
++        }
++      }
++    }
++    __syncthreads();
++
++    // 4. PV: V^T [512 x 128] @ P^T [128 x 32] -> dO^T [512 x 32] in TMEM [0..128)
++    if (t == 0) {
++      constexpr uint32_t idesc_pv = tc5_idesc_bf16(128, 32, true);
++#pragma unroll
++      for (int mt = 0; mt < 4; ++mt) {
++        const uint32_t a_base = baseKV + (2 * mt) * 16384;
++        const uint32_t t_col = taddr + mt * 32;
++#pragma unroll
++        for (int k = 0; k < 128; k += 16) {
++          const int p_slab = k >> 6, k_in = k & 63;
++          const uint64_t da = tc5_smem_desc_sw128(a_base + k * 128, 16384, 1024);
++          const uint64_t db = tc5_smem_desc_sw128(baseP + p_slab * 4096 + k_in * 2, 16, 1024);
++          tc5_mma_one(t_col, da, db, idesc_pv, k > 0);
++        }
++      }
++      tc5_commit(&mbar[1]);
++    }
++
++#pragma unroll
++    for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++      for (int h = 0; h < HB; ++h) o_acc[mt][h] = __fmul_rn(o_acc[mt][h], s_alp[h]);
++
++    tc5_mbar_wait(&mbar[1], phase1);
++    phase1 ^= 1;
++    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
++
++#pragma unroll
++    for (int i = 0; i < 2; ++i) {
++      const int mt = w_grp * 2 + i;
++      uint32_t r0[16];
++      tc5_ld32x32_x16(taddr + ((uint32_t)(w_in * 32) << 16) + mt * 32 + 0, r0);
++#pragma unroll
++      for (int h = 0; h < 16; ++h) o_acc[i][h] += __uint_as_float(r0[h]);
++      tc5_ld32x32_x16(taddr + ((uint32_t)(w_in * 32) << 16) + mt * 32 + 16, r0);
++#pragma unroll
++      for (int h = 0; h < 16; ++h) o_acc[i][16 + h] += __uint_as_float(r0[h]);
++    }
++    __syncthreads();
++  }
++
++#pragma unroll
++  for (int i = 0; i < 2; ++i) {
++    const int d = (w_grp * 2 + i) * 128 + w_in * 32 + lane;
++#pragma unroll
++    for (int h = 0; h < HB; ++h) {
++      if (h0 + h < heads) po[((c * rows + r) * heads + (h0 + h)) * LW + d] = o_acc[i][h];
++    }
++  }
++  if (t < HB && h0 + t < heads) {
++    const int64_t base = (c * rows + r) * heads + (h0 + t);
++    pm[base] = s_m[t];
++    pl[base] = s_l[t];
++  }
++
++  __syncthreads();
++  if (warp == 0) {
++    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 128;" ::"r"(taddr));
++    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
++  }
++}
++#endif
++
+ // latent._dense_chunks/_sparse_chunks (sparse 0/1), block (row, HB heads, chunk), 8 warps: online softmax by 32 keys.
+ template <int HB, int RW = 0>
+ constexpr int wide_smem() {
+@@ -54,6 +416,12 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   static_assert(!(FP8 && RW != 0), "the E4M3 cache holds the latent alone");
+   static_assert(!(SPLIT && FP8), "a split cache holds BF16 rows");
+   static_assert(!(PAGED8 && !FP8), "PAGED8 requires FP8");
++#ifdef TF_MLA_TCGEN05
++  if constexpr (HB == 32 && RW == 0 && !SPLIT) {
++    chunks_32_tcgen05<FP8, PAGED8>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
++    return;
++  }
++#endif
+   constexpr int MT = HB / 16, KW = LW + RW;
+   extern __shared__ __align__(16) unsigned char smem[];
+   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 7329a6bca..ada969286 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -79,18 +79,37 @@ pub const Kernels = struct {
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = undefined;
+         inline for (@typeInfo(Kernels).@"struct".field_names) |name| @field(k, name) = try m.function("tf_glm_" ++ name);
++        detectSm110(m.d);
++        const smem32 = chunks32Smem();
+         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
+         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
+         try k.chunks_16.allowDynamicShared(chunksSmem(16));
+-        try k.chunks_32.allowDynamicShared(chunksSmem(32));
++        try k.chunks_32.allowDynamicShared(smem32);
+         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
+-        try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
++        try k.chunks_32_fp8.allowDynamicShared(smem32);
+         try k.chunks_16_fp8_paged.allowDynamicShared(chunksSmem(16));
+-        try k.chunks_32_fp8_paged.allowDynamicShared(chunksSmem(32));
++        try k.chunks_32_fp8_paged.allowDynamicShared(smem32);
+         return k;
+     }
+ };
+ 
++var sm110_device: bool = false;
++
++fn detectSm110(d: *const cuda.Driver) void {
++    var dev: cuda.abi.Device = 0;
++    var major: c_int = 0;
++    if (d.api.cuCtxGetDevice(&dev) == cuda.abi.success and
++        d.api.cuDeviceGetAttribute(&major, .compute_capability_major, dev) == cuda.abi.success)
++    {
++        sm110_device = (major == 11);
++    }
++}
++
++/// Dynamic shared memory for `chunks_32*`: 193,536 B on sm_110 (tcgen05 KT=128), else `chunksSmem(32)`.
++pub fn chunks32Smem() u32 {
++    return if (sm110_device) 193_536 else chunksSmem(32);
++}
++
+ /// An element-wise kernel's launch: a block of 256 columns, `rows` x the blocks to cover `d`.
+ fn rowsLaunch(f: cuda.Function, stream: cuda.Stream, a: *cuda.Args, rows: usize, d: usize) !void {
+     try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(d, 256) }, .block = .{ .x = 256 } }, stream, a);
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index f141fa143..e635d5d57 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const cuda_pdl = @import("cuda_pdl.zig");
+ const glue = @import("cuda_glue.zig");
++const mm_mod = @import("cuda_mm.zig");
+ 
+ /// latent.CHUNK, KT, HB, HB_WIDE, PROMPT_ROWS, PROMPT_RB.
+ pub const chunk = 512;
+@@ -30,6 +31,29 @@ fn cdiv(a: usize, b: usize) u32 {
+ /// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
+ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
+     if (d != 256 or lw != 512) return error.LatentShape;
++    if (rows >= prompt_rows and mm_mod.cublasEnabled()) {
++        // Col-major batched: QA_h^T [lw, rows] = WK_h^T [lw, d] . Q_h^T [d, rows], batch = heads
++        const spec: cuda.cublaslt.Spec = .{
++            .ta = .n,
++            .tb = .n,
++            .m = lw,
++            .n = rows,
++            .k = d,
++            .a = .bf16,
++            .b = .bf16,
++            .c = .bf16,
++            .lda = lw,
++            .ldb = heads * d,
++            .ldc = heads * lw,
++            .batch = @intCast(heads),
++            .sa = d * lw,
++            .sb = d,
++            .sc = lw,
++        };
++        if (mm_mod.cublasBatched(stream, spec, wk, q, out)) return else |e| {
++            std.log.err("absorbQ cuBLASLt {d}x{d}: {}; falling back to kernel", .{ rows, heads, e });
++        }
++    }
+     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
+ }
+ 
+@@ -44,6 +68,29 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
+ /// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
+ pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
+     if (dv != 256 or lw != 512) return error.LatentShape;
++    if (rows >= prompt_rows and mm_mod.cublasEnabled()) {
++        // Col-major batched: VN_h^T [dv, rows] = (WV_h^T)^T [dv, lw] . OL_h^T [lw, rows], batch = heads
++        const spec: cuda.cublaslt.Spec = .{
++            .ta = .t,
++            .tb = .n,
++            .m = dv,
++            .n = rows,
++            .k = lw,
++            .a = .bf16,
++            .b = .bf16,
++            .c = .bf16,
++            .lda = lw,
++            .ldb = heads * lw,
++            .ldc = heads * dv,
++            .batch = @intCast(heads),
++            .sa = dv * lw,
++            .sb = lw,
++            .sc = dv,
++        };
++        if (mm_mod.cublasBatched(stream, spec, wv, ol, out)) return else |e| {
++            std.log.err("expandV cuBLASLt {d}x{d}: {}; falling back to kernel", .{ rows, heads, e });
++        }
++    }
+     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
+ }
+ 
+@@ -116,7 +163,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64,
+         a.add(t.pt);
+         a.add(@as(i64, @intCast(t.ps)));
+     }
+-    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
++    const shared = if (hb == heads_tile_wide) glue.chunks32Smem() else glue.chunksSmem(heads_tile);
+     try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 61b4b192e..193eaa4dc 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -126,7 +126,9 @@ pub fn cublasEnabled() bool {
+ 
+ /// One plan a (m, n, k, out type): cuBLASLt's algorithm choice for the shape, kept for the next call.
+ const Plan = struct { m: u64, n: u64, k: u64, out_f32: bool, lin: cuda.cublaslt.Linear };
++const BPlan = struct { spec: cuda.cublaslt.Spec, gemm: cuda.cublaslt.Gemm };
+ const max_plans = 512; // a prompt's row counts vary (chunk, tail, batched rows): one plan a shape
++const max_bplans = 128; // strided batched GEMM plans (absorb_q / expand_v prompt passes)
+ const max_ws = 4; // streams that run prompt matmuls (the main one and a pair's side stream); each its own workspace
+ 
+ /// The cuBLASLt library, a workspace per stream and the plans, opened on the first prompt matmul (TF_GLM_MM_CUBLAS).
+@@ -139,6 +141,9 @@ const Blas = struct {
+     n_ws: usize = 0,
+     plans: [max_plans]Plan = undefined,
+     n_plans: usize = 0,
++    bhandle: ?cuda.cublaslt.Handle = null,
++    bplans: [max_bplans]BPlan = undefined,
++    n_bplans: usize = 0,
+     lock: std.atomic.Mutex = .unlocked,
+ };
+ var blas_state: ?Blas = null;
+@@ -153,24 +158,47 @@ fn blasFor(d: *const cuda.Driver) !*Blas {
+     return &blas_state.?;
+ }
+ 
++fn wsFor(b: *Blas, s: cuda.Stream) !usize {
++    for (b.ws_stream[0..b.n_ws], 0..) |h, i| if (h == s.handle) return i;
++    if (b.n_ws == max_ws) return error.TooManyStreams;
++    b.ws[b.n_ws] = try cuda.DeviceBuffer.alloc(s.d, b.ws_len);
++    b.ws_stream[b.n_ws] = s.handle;
++    const idx = b.n_ws;
++    b.n_ws += 1;
++    return idx;
++}
++
++/// Strided batched BF16 GEMM (FP32 accumulate) on the shared cuBLASLt library & per-stream workspace.
++pub fn cublasBatched(s: cuda.Stream, spec: cuda.cublaslt.Spec, a: u64, b_ptr: u64, c: u64) !void {
++    const b = try blasFor(s.d);
++    while (!b.lock.tryLock()) std.Thread.yield() catch {};
++    defer b.lock.unlock();
++    const ws = try wsFor(b, s);
++    if (b.bhandle == null) b.bhandle = try cuda.cublaslt.createHandle(&b.lt);
++    var plan: ?*BPlan = null;
++    for (b.bplans[0..b.n_bplans]) |*p| {
++        if (std.meta.eql(p.spec, spec)) {
++            plan = p;
++            break;
++        }
++    }
++    if (plan == null) {
++        if (b.n_bplans == max_bplans) return error.TooManyPlans;
++        const p = &b.bplans[b.n_bplans];
++        p.* = .{ .spec = spec, .gemm = try cuda.cublaslt.Gemm.init(&b.lt, b.bhandle.?, spec, b.ws_len) };
++        b.n_bplans += 1;
++        plan = p;
++    }
++    try plan.?.gemm.run(1.0, a, b_ptr, 0.0, c, b.ws[ws].ptr, b.ws_len, s.handle);
++}
++
+ /// D[rows][n] = X[rows][k] . W[n][k]^T in bf16 with fp32 accumulate, out fp32 (`out_f32`) or bf16.
+ fn cublasMm(s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, kk: usize, out_f32: bool) !void {
+     const b = try blasFor(s.d);
+     while (!b.lock.tryLock()) std.Thread.yield() catch {};
+     defer b.lock.unlock();
+     const out_ty: cuda.cublaslt.DataType = if (out_f32) .f32 else .bf16;
+-    var ws: ?usize = null;
+-    for (b.ws_stream[0..b.n_ws], 0..) |h, i| if (h == s.handle) {
+-        ws = i;
+-        break;
+-    };
+-    if (ws == null) {
+-        if (b.n_ws == max_ws) return error.TooManyStreams;
+-        b.ws[b.n_ws] = try cuda.DeviceBuffer.alloc(s.d, b.ws_len);
+-        b.ws_stream[b.n_ws] = s.handle;
+-        ws = b.n_ws;
+-        b.n_ws += 1;
+-    }
++    const ws = try wsFor(b, s);
+     var plan: ?*Plan = null;
+     for (b.plans[0..b.n_plans]) |*p| {
+         if (p.m == rows and p.n == n and p.k == kk and p.out_f32 == out_f32) {
+@@ -185,7 +213,7 @@ fn cublasMm(s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, kk:
+         b.n_plans += 1;
+         plan = p;
+     }
+-    try plan.?.lin.run(x, w, out, b.ws[ws.?].ptr, b.ws_len, s.handle);
++    try plan.?.lin.run(x, w, out, b.ws[ws].ptr, b.ws_len, s.handle);
+ }
+ 
+ /// K slices fixed by the shape: column tiles times slices reach the target, each slice at least 4 groups of 64.
